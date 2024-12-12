@@ -14,13 +14,40 @@ from utils.registration_utils import (
     normalize_image_sizes,
     find_matching_points,
     filter_matches_geometric,
-    generate_distinct_colors,
     create_geojson_features,
     scale_points_to_full_size,
     get_slides_for_registration,
     create_registration_points,
+    generate_distinct_colors,
+    generate_fiducial_points,
+    create_thumbnail_card,
 )
 import time
+
+
+osdConfig = config = {
+    "eventBindings": [
+        {"event": "keyDown", "key": "c", "action": "cycleProp", "property": "class"},
+        {
+            "event": "keyDown",
+            "key": "x",
+            "action": "cyclePropReverse",
+            "property": "class",
+        },
+        {"event": "keyDown", "key": "d", "action": "deleteItem"},
+        {"event": "keyDown", "key": "n", "action": "newItem", "tool": "rectangle"},
+        {"event": "keyDown", "key": "e", "action": "editItem", "tool": "rectangle"},
+        {"event": "keyDown", "key": "l", "action": "grabColor"},
+        {"event": "mouseEnter", "action": "dashCallback", "callback": "mouseEnter"},
+        {"event": "mouseLeave", "action": "dashCallback", "callback": "mouseLeave"},
+    ],
+    "callbacks": [
+        {"eventName": "item-created", "callback": "createItem"},
+        {"eventName": "property-changed", "callback": "propertyChanged"},
+        {"eventName": "item-deleted", "callback": "itemDeleted"},
+        {"eventName": "item-edited", "callback": "itemEdited"},
+    ],
+}
 
 ##https://www.sciencedirect.com/science/article/pii/S0010482522000932
 
@@ -28,86 +55,27 @@ import time
 fixed_image_viewer = dash_paperdragon.DashPaperdragon(
     id="fixed-image-viewer",
     viewerHeight=400,
+    viewerWidth=400,
     viewportBounds={"x": 0, "y": 0, "width": 0, "height": 0},
+    config=osdConfig,
 )
 
 moving_image_viewer = dash_paperdragon.DashPaperdragon(
     id="moving-image-viewer",
     viewerHeight=400,
+    viewerWidth=400,
     viewportBounds={"x": 0, "y": 0, "width": 0, "height": 0},
+    config=osdConfig,
 )
 
 
-# Function to generate distinct colors
-def generate_distinct_colors(n):
-    colors = []
-    for i in range(n):
-        hue = i / n
-        # Use high saturation and value for vibrant, visible colors
-        rgb = colorsys.hsv_to_rgb(hue, 0.9, 0.9)
-        # Convert to hex color
-        hex_color = "#{:02x}{:02x}{:02x}".format(
-            int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)
-        )
-        colors.append(hex_color)
-    return colors
-
-
-# Function to generate fiducial points
-def generate_fiducial_points(image_bounds, num_points=8):
-    """
-    Generate evenly distributed points within the image bounds
-    """
-    width = image_bounds["width"]
-    height = image_bounds["height"]
-
-    # Create a grid of points, avoiding edges
-    margin = 0.1  # 10% margin from edges
-    x_points = np.linspace(width * margin, width * (1 - margin), 3)
-    y_points = np.linspace(height * margin, height * (1 - margin), 3)
-
-    # Generate distinct colors for each point
-    colors = generate_distinct_colors(num_points)
-
-    points = []
-    i = 0
-    for x in x_points:
-        for y in y_points:
-            if i < num_points:  # Only add up to num_points
-                points.append(
-                    {
-                        "x": float(x),
-                        "y": float(y),
-                        "radius": 5,
-                        "color": colors[i],  # Assign unique color to each point
-                        "fillColor": colors[i],
-                        "strokeColor": colors[i],
-                    }
-                )
-                i += 1
-
-    return points[:num_points]
-
-
-# Create thumbnail card component (same as in caseViewer)
-def create_thumbnail_card(item):
-    return dbc.Card(
-        [
-            dbc.CardHeader(
-                item.get("meta", {})
-                .get("npSchema", {})
-                .get("stainID", "Unknown Stain"),
-                className="text-center",
-            ),
-            dbc.CardImg(
-                src=f"{DSA_BASE_URL}/item/{item['_id']}/tiles/thumbnail?token={token_info['_id']}",
-                top=True,
-                style={"height": "150px", "objectFit": "contain"},
-            ),
-        ],
-        className="mb-3",
-        style={"width": "200px"},
-    )
+merged_image_viewer = dash_paperdragon.DashPaperdragon(
+    id="merged-image-viewer",
+    viewerHeight=400,
+    viewerWidth=400,
+    viewportBounds={"x": 0, "y": 0, "width": 0, "height": 0},
+    config=osdConfig,
+)
 
 
 # Add thumbnail grid container
@@ -189,34 +157,67 @@ thumbnail_sections = dbc.Row(
     className="mb-3",
 )
 
-# Add modal for thumbnail debugging
-thumbnail_debug_modal = dbc.Modal(
+# Define merged image controls as a separate component
+merged_image_controls = dbc.Row(
     [
-        dbc.ModalHeader(dbc.ModalTitle("Registration Debug Information")),
-        dbc.ModalBody(
+        dbc.Col(
             [
-                dbc.Tabs(
-                    [
-                        dbc.Tab(
-                            [html.Div(id="modal-fixed-debug-content")],
-                            label="Fixed Image",
-                        ),
-                        dbc.Tab(
-                            [html.Div(id="modal-moving-debug-content")],
-                            label="Moving Image",
-                        ),
-                    ]
-                )
-            ]
+                html.Label("Opacity:", className="mb-1 small"),
+                dcc.Slider(
+                    id="moving-image-opacity",
+                    min=0,
+                    max=1,
+                    step=0.1,
+                    value=0.5,
+                    marks=None,
+                    tooltip={"placement": "bottom", "always_visible": True},
+                    className="mt-1 narrow-slider",
+                ),
+            ],
+            width="auto",
+            style={"width": "150px"},
         ),
-        dbc.ModalFooter(
-            dbc.Button(
-                "Close", id="close-thumbnail-modal", className="ms-auto", n_clicks=0
-            )
+        dbc.Col(
+            [
+                html.Label("X:", className="mb-1 small"),
+                dcc.Input(
+                    id="moving-image-x-offset",
+                    type="number",
+                    value=0,
+                    className="form-control form-control-sm",
+                    style={"width": "80px"},
+                ),
+            ],
+            width="auto",
+        ),
+        dbc.Col(
+            [
+                html.Label("Y:", className="mb-1 small"),
+                dcc.Input(
+                    id="moving-image-y-offset",
+                    type="number",
+                    value=0,
+                    className="form-control form-control-sm",
+                    style={"width": "80px"},
+                ),
+            ],
+            width="auto",
+        ),
+        dbc.Col(
+            [
+                html.Label("Rot:", className="mb-1 small"),
+                dcc.Input(
+                    id="moving-image-rotation",
+                    type="number",
+                    value=0,
+                    className="form-control form-control-sm",
+                    style={"width": "80px"},
+                ),
+            ],
+            width="auto",
         ),
     ],
-    id="thumbnail-debug-modal",
-    size="lg",
+    className="g-2 align-items-end",
 )
 
 # Basic layout for registration controls
@@ -224,11 +225,12 @@ registrationControls_layout = dbc.Container(
     [
         dcc.Store(id="registration_caseId", data="641bfd45867536bb7a236ae1"),
         dcc.Store(id="registration_blockId", data="5"),
+        dcc.Store(id="moving-image-metadata", data={}),
         dbc.Row(
             [
                 dbc.Col(
                     [
-                        html.H3("Registration Controls", className="mb-2"),
+                        # html.H3("Registration Controls", className="mb-2"),
                         dbc.Row(
                             [
                                 # Feature Detection Method
@@ -337,21 +339,6 @@ registrationControls_layout = dbc.Container(
                                     ],
                                     width=6,
                                 ),
-                                # Debug Button
-                                dbc.Col(
-                                    [
-                                        html.Label(
-                                            "\u00A0", className="mb-1 d-block small"
-                                        ),  # invisible label for alignment
-                                        dbc.Button(
-                                            "Debug",
-                                            id="open-thumbnail-modal",
-                                            color="secondary",
-                                            size="sm",
-                                        ),
-                                    ],
-                                    width=1,
-                                ),
                             ],
                             className="mb-2 g-2 align-items-end",
                         ),
@@ -368,7 +355,8 @@ registrationControls_layout = dbc.Container(
                                                     className="d-flex flex-wrap gap-2 mb-3",
                                                 )
                                             ]
-                                        )
+                                        ),
+                                        dbc.Col([merged_image_controls], width=4),
                                     ]
                                 ),
                             ],
@@ -397,7 +385,7 @@ registrationControls_layout = dbc.Container(
                                                     ],
                                                 ),
                                             ],
-                                            width=6,
+                                            width=4,
                                         ),
                                         # Moving viewer column
                                         dbc.Col(
@@ -417,7 +405,27 @@ registrationControls_layout = dbc.Container(
                                                     ],
                                                 ),
                                             ],
-                                            width=6,
+                                            width=4,
+                                        ),
+                                        # Merged Image Viewer
+                                        dbc.Col(
+                                            [
+                                                html.Div(
+                                                    id="merged-image-info",
+                                                    className="image-info mb-2",
+                                                ),
+                                                html.Div(
+                                                    className="viewer-container",
+                                                    children=[
+                                                        html.Div(
+                                                            "MERGED",
+                                                            className="viewer-label",
+                                                        ),
+                                                        merged_image_viewer,
+                                                    ],
+                                                ),
+                                            ],
+                                            width=4,
                                         ),
                                     ],
                                     className="g-2",
@@ -429,7 +437,7 @@ registrationControls_layout = dbc.Container(
                 )
             ]
         ),
-        thumbnail_debug_modal,
+        # thumbnail_debug_modal,
     ],
     fluid=True,
     className="px-2",
@@ -465,6 +473,10 @@ def update_registration_thumbnails(slideList, selected_block):
         Output("fixed-image-viewer", "inputToPaper"),
         Output("moving-image-viewer", "tileSources"),
         Output("moving-image-viewer", "inputToPaper"),
+        # Add outputs for the control values
+        Output("moving-image-x-offset", "value"),
+        Output("moving-image-y-offset", "value"),
+        Output("moving-image-rotation", "value"),
     ],
     [
         Input("caseSlideSet_store", "data"),
@@ -486,7 +498,7 @@ def setup_registration_images(
     # Get slides
     he_slide, moving_slide = get_slides_for_registration(slideList, selected_block)
     if not he_slide or not moving_slide:
-        return [], {}, [], {}
+        return [], {}, [], {}, 0, 0, 0
 
     # Get image dimensions for both slides
     try:
@@ -541,6 +553,9 @@ def setup_registration_images(
                 {"actions": []},
                 moving_tile_source,
                 {"actions": []},
+                0,  # Default X offset
+                0,  # Default Y offset
+                0,  # Default rotation
             )
 
         print(f"Using thumbnail width: {thumbnail_width}")
@@ -597,6 +612,21 @@ def setup_registration_images(
             print("Fixed points:", fixed_points)
             print("Moving points:", moving_points)
 
+            # Convert points to numpy arrays for transformation calculation
+            fixed_np = np.float32(fixed_points)
+            moving_np = np.float32(moving_points)
+
+            # Calculate transformation matrix
+            transform_matrix = cv2.estimateAffinePartial2D(moving_np, fixed_np)[0]
+
+            # Extract transformation parameters
+            scale = np.sqrt(transform_matrix[0, 0] ** 2 + transform_matrix[0, 1] ** 2)
+            rotation = np.degrees(
+                np.arctan2(transform_matrix[1, 0], transform_matrix[0, 0])
+            )
+            x_offset = transform_matrix[0, 2]
+            y_offset = transform_matrix[1, 2]
+
             # Generate colors and create GeoJSON features
             colors = generate_distinct_colors(len(fixed_points))
             fixed_items = create_geojson_features(fixed_points, colors, "fixed")
@@ -607,6 +637,9 @@ def setup_registration_images(
                 {"actions": [{"type": "drawItems", "itemList": fixed_items}]},
                 moving_tile_source,
                 {"actions": [{"type": "drawItems", "itemList": moving_items}]},
+                x_offset,  # X offset value
+                y_offset,  # Y offset value
+                rotation,  # Rotation value
             )
 
     except Exception as e:
@@ -615,7 +648,16 @@ def setup_registration_images(
 
         traceback.print_exc()
 
-    return fixed_tile_source, {"actions": []}, moving_tile_source, {"actions": []}
+    # Return defaults if registration fails
+    return (
+        fixed_tile_source,
+        {"actions": []},
+        moving_tile_source,
+        {"actions": []},
+        0,  # Default X offset
+        0,  # Default Y offset
+        0,  # Default rotation
+    )
 
 
 # Add new callback for metadata
@@ -806,19 +848,19 @@ def update_moving_thumbnails(moving_paper):
     )
 
 
-# Add callback for modal control
-@callback(
-    Output("thumbnail-debug-modal", "is_open"),
-    [
-        Input("open-thumbnail-modal", "n_clicks"),
-        Input("close-thumbnail-modal", "n_clicks"),
-    ],
-    [State("thumbnail-debug-modal", "is_open")],
-)
-def toggle_modal(n1, n2, is_open):
-    if n1 or n2:
-        return not is_open
-    return is_open
+# # Add callback for modal control
+# @callback(
+#     Output("thumbnail-debug-modal", "is_open"),
+#     [
+#         Input("open-thumbnail-modal", "n_clicks"),
+#         Input("close-thumbnail-modal", "n_clicks"),
+#     ],
+#     [State("thumbnail-debug-modal", "is_open")],
+# )
+# def toggle_modal(n1, n2, is_open):
+#     if n1 or n2:
+#         return not is_open
+#     return is_open
 
 
 # Add callbacks for modal content
@@ -941,46 +983,193 @@ def update_loading_status(method, num_points):
 
 
 @callback(
-    [Output("fixed-image-info", "children"), Output("moving-image-info", "children")],
+    [
+        Output("fixed-image-info", "children"),
+        Output("moving-image-info", "children"),
+        Output("moving-image-metadata", "data"),
+    ],
     [
         Input("fixed-image-viewer", "tileSources"),
         Input("moving-image-viewer", "tileSources"),
     ],
 )
 def update_image_info(fixed_tiles, moving_tiles):
-    """Update the image information display"""
+    """Update the image information display and store metadata"""
     if not fixed_tiles or not moving_tiles:
-        return "", ""
+        return "", "", {}
 
     def get_girder_info(tiles):
         if isinstance(tiles, list) and len(tiles) > 0:
-            # Extract itemId from the tileSource URL
             tile_source = tiles[0].get("tileSource", "")
             item_id = tile_source.split("/item/")[1].split("/")[0]
 
-            # Get tile info from Girder
             try:
                 tile_info = gc.get(f"item/{item_id}/tiles")
-                return [
-                    html.Div(
-                        f"Size: {tile_info.get('sizeX', 'N/A')}×{tile_info.get('sizeY', 'N/A')}  |  "
-                        f"Resolution: {tile_info.get('mm_x', 'N/A')}  |  "
-                        f"Magnification: {tile_info.get('magnification', 'N/A')}  |  "
-                        f"Source: {item_id}  |  "
-                        f"Levels: {tile_info.get('levels', 'N/A')}",
-                        style={
-                            "whiteSpace": "nowrap",
-                            "overflow": "hidden",
-                            "textOverflow": "ellipsis",
-                        },
-                    )
-                ]
+                return tile_info
             except Exception as e:
                 print(f"Error getting tile info: {e}")
-                return ["Error getting tile info"]
-        return ["No tile information available"]
+                return {}
+        return {}
 
     fixed_info = get_girder_info(fixed_tiles)
     moving_info = get_girder_info(moving_tiles)
 
-    return fixed_info, moving_info
+    # Store moving image metadata
+    moving_metadata = {
+        "sizeX": moving_info.get("sizeX", 1.0),
+        "sizeY": moving_info.get("sizeY", 1.0),
+        "magnification": moving_info.get("magnification", "N/A"),
+    }
+
+    # Create display info
+    fixed_display = [
+        html.Div(
+            f"Size: {fixed_info.get('sizeX', 'N/A')}×{fixed_info.get('sizeY', 'N/A')}  |  "
+            f"Magnification: {fixed_info.get('magnification', 'N/A')}"
+        )
+    ]
+
+    moving_display = [
+        html.Div(
+            f"Size: {moving_info.get('sizeX', 'N/A')}×{moving_info.get('sizeY', 'N/A')}  |  "
+            f"Magnification: {moving_info.get('magnification', 'N/A')}"
+        )
+    ]
+
+    return fixed_display, moving_display, moving_metadata
+
+
+@callback(
+    [
+        Output("merged-image-viewer", "tileSources"),
+        Output("merged-image-viewer", "inputToPaper"),
+        Output("merged-image-info", "children"),
+    ],
+    [
+        Input("fixed-image-viewer", "tileSources"),
+        Input("moving-image-viewer", "tileSources"),
+        Input("fixed-image-viewer", "inputToPaper"),
+        Input("moving-image-viewer", "inputToPaper"),
+        Input("moving-image-opacity", "value"),
+    ],
+)
+def update_merged_viewer(fixed_tiles, moving_tiles, fixed_paper, moving_paper, opacity):
+    """Combine fixed and moving images in the merged viewer"""
+    if not fixed_tiles or not moving_tiles:
+        return [], {}, ["No tile information available"]
+
+    try:
+        merged_sources = [
+            fixed_tiles[0],  # Fixed image as base layer
+            {
+                **moving_tiles[0],  # Moving image with opacity
+                "opacity": opacity,  # Use the slider value
+                "compositeOperation": "source-over",  # This controls how images are blended
+            },
+        ]
+
+        # Combine the paper inputs (registration points) from both viewers
+        merged_paper = {"actions": []}
+        if fixed_paper and "actions" in fixed_paper:
+            merged_paper["actions"].extend(fixed_paper["actions"])
+        if moving_paper and "actions" in moving_paper:
+            merged_paper["actions"].extend(moving_paper["actions"])
+
+        # Get info for the merged viewer
+        merged_info = [
+            html.Div(
+                "Merged View (Moving image opacity: 0.5)",
+                style={
+                    "whiteSpace": "nowrap",
+                    "overflow": "hidden",
+                    "textOverflow": "ellipsis",
+                },
+            )
+        ]
+
+        return merged_sources, merged_paper, merged_info
+
+    except Exception as e:
+        print(f"Error in merged viewer: {str(e)}")
+        return [], {}, ["Error creating merged view"]
+
+
+@callback(
+    Output("merged-image-viewer", "tileSourceProps"),
+    [
+        Input("moving-image-opacity", "value"),
+        Input("moving-image-x-offset", "value"),
+        Input("moving-image-y-offset", "value"),
+        Input("moving-image-rotation", "value"),
+        Input("moving-image-metadata", "data"),
+    ],
+)
+def update_transform(opacity, x_offset, y_offset, rotation, metadata):
+    """Update the moving image transformation based on control values"""
+    try:
+        opacity = float(opacity) if opacity is not None else 1.0
+        x_offset = float(x_offset) if x_offset is not None else 0
+        y_offset = float(y_offset) if y_offset is not None else 0
+        rotation = float(rotation) if rotation is not None else 0
+
+        # Get scale factor from stored metadata
+        scale_factor = metadata.get("sizeX", 1.0)
+
+        props = [
+            {
+                "opacity": opacity,
+                "x": x_offset,
+                "y": y_offset,
+                "rotation": rotation,
+                "flipped": False,
+                "scaleFactor": scale_factor,
+                "index": 0,
+            }
+        ]
+
+        print(
+            f"Updating transform - Opacity: {opacity}, Scale: {scale_factor}, Rotation: {rotation}, X: {x_offset}, Y: {y_offset}"
+        )
+        return props
+
+    except Exception as e:
+        print(f"Error in transform update: {str(e)}")
+        return [
+            {
+                "opacity": 1.0,
+                "x": 0,
+                "y": 0,
+                "rotation": 0,
+                "flipped": False,
+                "scaleFactor": 1.0,
+                "index": 0,
+            }
+        ]
+
+
+# def create_tile_source_props(r, index=None):
+#     """Create tile source properties for viewer updates"""
+#     try:
+#         defaults = get_default_tilesource_props()
+#         sizeX = float(r.get("sizeX", 1)) or 1  # Use 1 if sizeX is 0 or None
+
+#         imgTileSource = f"{r['apiUrl']}/item/{r['_id']}/tiles/dzi.dzi"
+#         props = {
+#             "tileSource": imgTileSource,
+#             "opacity": (
+#                 float(r.get("opacity", defaults["opacity"]))
+#                 if r.get("isVisible", defaults["isVisible"])
+#                 else 0
+#             ),
+#             "x": float(r.get("xOffset", defaults["x"])) / sizeX,
+#             "y": float(r.get("yOffset", defaults["y"])) / sizeX,
+#             "rotation": float(r.get("rotation", defaults["rotation"])),
+#             "flipped": bool(r.get("flipped", defaults["flipped"])),
+#             "scaleFactor": float(r.get("scaleFactor", defaults["scaleFactor"])),
+#             "tileSource": imgTileSource,
+#         }
+
+#         if index is not None:
+#             props["index"] = index
+
+#         return props

@@ -5,6 +5,43 @@ import requests
 from io import BytesIO
 from PIL import Image
 from settings import gc, DSA_BASE_URL, token_info
+import dash_bootstrap_components as dbc
+
+
+# Function to generate fiducial points
+def generate_fiducial_points(image_bounds, num_points=8):
+    """
+    Generate evenly distributed points within the image bounds
+    """
+    width = image_bounds["width"]
+    height = image_bounds["height"]
+
+    # Create a grid of points, avoiding edges
+    margin = 0.1  # 10% margin from edges
+    x_points = np.linspace(width * margin, width * (1 - margin), 3)
+    y_points = np.linspace(height * margin, height * (1 - margin), 3)
+
+    # Generate distinct colors for each point
+    colors = generate_distinct_colors(num_points)
+
+    points = []
+    i = 0
+    for x in x_points:
+        for y in y_points:
+            if i < num_points:  # Only add up to num_points
+                points.append(
+                    {
+                        "x": float(x),
+                        "y": float(y),
+                        "radius": 5,
+                        "color": colors[i],  # Assign unique color to each point
+                        "fillColor": colors[i],
+                        "strokeColor": colors[i],
+                    }
+                )
+                i += 1
+
+    return points[:num_points]
 
 
 def get_thumbnail_image(item_id, width=1024):
@@ -334,6 +371,55 @@ def filter_points_with_constraints(
     except Exception as e:
         print(f"Error in constraint filtering: {str(e)}")
         return fixed_points, moving_points
+
+
+def create_thumbnail_card(item):
+    return dbc.Card(
+        [
+            dbc.CardHeader(
+                item.get("meta", {})
+                .get("npSchema", {})
+                .get("stainID", "Unknown Stain"),
+                className="text-center",
+                style={
+                    "padding": "0.1rem",  # Minimal padding
+                    "font-size": "0.8rem",  # Small font
+                    "line-height": "1",  # Reduce line height
+                    "font-weight": "500",  # Medium weight
+                    "margin": "0",  # Remove margin
+                },
+            ),
+            dbc.CardImg(
+                src=f"{DSA_BASE_URL}/item/{item['_id']}/tiles/thumbnail?token={token_info['_id']}",
+                top=True,
+                style={"height": "150px", "objectFit": "contain"},
+            ),
+        ],
+        className="mb-3",
+        style={"width": "200px"},
+    )
+
+
+#     )
+# # Create thumbnail card component (same as in caseViewer)
+# def create_thumbnail_card(item):
+#     return dbc.Card(
+#         [
+#             dbc.CardHeader(
+#                 item.get("meta", {})
+#                 .get("npSchema", {})
+#                 .get("stainID", "Unknown Stain"),
+#                 className="text-center",
+#             ),
+#             dbc.CardImg(
+#                 src=f"{DSA_BASE_URL}/item/{item['_id']}/tiles/thumbnail?token={token_info['_id']}",
+#                 top=True,
+#                 style={"height": "150px", "objectFit": "contain"},
+#             ),
+#         ],
+#         className="mb-3",
+#         style={"width": "200px"},
+#     )
 
 
 def create_geojson_features(points, colors, prefix="fiducial"):
