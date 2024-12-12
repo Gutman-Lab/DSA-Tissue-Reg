@@ -1,0 +1,58 @@
+.viewer-container {
+    position: relative;
+    min-height: 400px;
+}
+
+.viewer-label {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 25px;
+    background-color: #e9ecef;
+    color: #495057;
+    font-weight: bold;
+    writing-mode: vertical-rl;
+    text-orientation: upright;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    letter-spacing: 0.2em;
+    font-size: 0.8em;
+    border-radius: 4px 0 0 4px;
+    z-index: 1;
+}
+
+.viewer-container>div:last-child {
+    margin-left: 25px;
+}
+
+.image-info {
+    font-family: 'Courier New', monospace;
+    color: #666;
+    padding: 2px 8px;
+    background-color: #f8f9fa;
+    border-radius: 4px;
+    font-size: 11px;
+    line-height: 1.2;
+    margin-bottom: 4px;
+}
+
+.image-info>div>div {
+    margin-bottom: 4px;
+    white-space: pre;
+    font-family: 'Courier New', monospace;
+}
+
+.image-info strong {
+    display: inline-block;
+    width: 100px;
+    color: #495057;
+}
+
+.image-info>div>div::after {
+    content: "";
+    border-bottom: 1px dotted #ccc;
+    flex: 1;
+    margin: 0 4px;
+}

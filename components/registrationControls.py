@@ -9,6 +9,18 @@ import requests
 from io import BytesIO
 from PIL import Image
 import base64
+from utils.registration_utils import (
+    get_thumbnail_image,
+    normalize_image_sizes,
+    find_matching_points,
+    filter_matches_geometric,
+    generate_distinct_colors,
+    create_geojson_features,
+    scale_points_to_full_size,
+    get_slides_for_registration,
+    create_registration_points,
+)
+import time
 
 ##https://www.sciencedirect.com/science/article/pii/S0010482522000932
 
@@ -219,20 +231,24 @@ registrationControls_layout = dbc.Container(
                         html.H3("Registration Controls", className="mb-2"),
                         dbc.Row(
                             [
+                                # Feature Detection Method
                                 dbc.Col(
                                     [
-                                        html.Label(
-                                            "Feature Detection Method:",
-                                            className="mb-1",
-                                        ),
-                                        dbc.RadioItems(
+                                        html.Label("Method:", className="mb-1 small"),
+                                        dbc.Select(
                                             id="feature-detection-method",
                                             options=[
-                                                {"label": "ORB", "value": "orb"},
-                                                {"label": "SIFT", "value": "sift"},
+                                                {"label": "ORB (Fast)", "value": "orb"},
+                                                {
+                                                    "label": "SIFT (Accurate)",
+                                                    "value": "sift",
+                                                },
                                                 {"label": "AKAZE", "value": "akaze"},
                                                 {"label": "BRISK", "value": "brisk"},
-                                                {"label": "Canny", "value": "canny"},
+                                                {
+                                                    "label": "Canny Edge",
+                                                    "value": "canny",
+                                                },
                                                 {
                                                     "label": "Adaptive",
                                                     "value": "adaptive",
@@ -241,77 +257,39 @@ registrationControls_layout = dbc.Container(
                                                     "label": "Watershed",
                                                     "value": "watershed",
                                                 },
+                                                {
+                                                    "label": "Mutual Information",
+                                                    "value": "intensity",
+                                                },
                                             ],
-                                            value="orb",
-                                            inline=True,
-                                            className="small",
+                                            value="akaze",
+                                            size="sm",
                                         ),
                                     ],
-                                    width=4,
+                                    width=2,
                                 ),
+                                # Number of Points
                                 dbc.Col(
                                     [
-                                        html.Label(
-                                            "Registration Parameters:", className="mb-1"
-                                        ),
-                                        dbc.Checklist(
-                                            id="registration-constraints",
+                                        html.Label("Points:", className="mb-1 small"),
+                                        dbc.Select(
+                                            id="num-points-selector",
                                             options=[
-                                                {
-                                                    "label": "Limit Rotation (±10°)",
-                                                    "value": "limit_rotation",
-                                                },
-                                                {
-                                                    "label": "Similar Scale (±10%)",
-                                                    "value": "similar_scale",
-                                                },
-                                                {
-                                                    "label": "Center Aligned",
-                                                    "value": "center_aligned",
-                                                },
-                                                {
-                                                    "label": "Preserve Tissue Shape",
-                                                    "value": "preserve_shape",
-                                                },
+                                                {"label": "6 pts", "value": 6},
+                                                {"label": "8 pts", "value": 8},
+                                                {"label": "12 pts", "value": 12},
+                                                {"label": "16 pts", "value": 16},
                                             ],
-                                            value=["limit_rotation", "similar_scale"],
-                                            inline=True,
-                                            className="small",
-                                        ),
-                                    ],
-                                    width=8,
-                                ),
-                            ],
-                            className="mb-2 g-2",
-                        ),
-                        dbc.Row(
-                            [
-                                dbc.Col(
-                                    [
-                                        html.Label(
-                                            "Number of Points:", className="mb-1"
-                                        ),
-                                        dcc.Slider(
-                                            id="num-points-slider",
-                                            min=6,
-                                            max=16,
-                                            step=2,
                                             value=8,
-                                            marks={6: "6", 8: "8", 12: "12", 16: "16"},
-                                            className="mb-1",
-                                        ),
-                                        html.Small(
-                                            "Recommended: 8-12 points",
-                                            className="text-muted",
+                                            size="sm",
                                         ),
                                     ],
-                                    width=6,
+                                    width=1,
                                 ),
+                                # Thumbnail Width
                                 dbc.Col(
                                     [
-                                        html.Label(
-                                            "Thumbnail Width:", className="mb-1"
-                                        ),
+                                        html.Label("Width:", className="mb-1 small"),
                                         dbc.Select(
                                             id="thumbnail-width-selector",
                                             options=[
@@ -324,45 +302,132 @@ registrationControls_layout = dbc.Container(
                                             size="sm",
                                         ),
                                     ],
-                                    width=4,
+                                    width=1,
                                 ),
-                                dbc.Col(
-                                    dbc.Button(
-                                        "Show Debug Info",
-                                        id="open-thumbnail-modal",
-                                        color="secondary",
-                                        size="sm",
-                                        className="mt-4",
-                                    ),
-                                    width=2,
-                                ),
-                            ],
-                            className="mb-2 g-2",
-                        ),
-                        dbc.Row(
-                            [
+                                # Registration Parameters
                                 dbc.Col(
                                     [
-                                        html.Div(
-                                            id="registration-thumbnail-grid",
-                                            className="d-flex flex-wrap gap-2 mb-3",
+                                        html.Label(
+                                            "Constraints:", className="mb-1 small"
+                                        ),
+                                        dbc.Checklist(
+                                            id="registration-constraints",
+                                            options=[
+                                                {
+                                                    "label": "Rotation ±10°",
+                                                    "value": "limit_rotation",
+                                                },
+                                                {
+                                                    "label": "Scale ±10%",
+                                                    "value": "similar_scale",
+                                                },
+                                                {
+                                                    "label": "Center",
+                                                    "value": "center_aligned",
+                                                },
+                                                {
+                                                    "label": "Shape",
+                                                    "value": "preserve_shape",
+                                                },
+                                            ],
+                                            value=["limit_rotation", "similar_scale"],
+                                            inline=True,
+                                            className="small",
+                                        ),
+                                    ],
+                                    width=6,
+                                ),
+                                # Debug Button
+                                dbc.Col(
+                                    [
+                                        html.Label(
+                                            "\u00A0", className="mb-1 d-block small"
+                                        ),  # invisible label for alignment
+                                        dbc.Button(
+                                            "Debug",
+                                            id="open-thumbnail-modal",
+                                            color="secondary",
+                                            size="sm",
+                                        ),
+                                    ],
+                                    width=1,
+                                ),
+                            ],
+                            className="mb-2 g-2 align-items-end",
+                        ),
+                        dcc.Loading(
+                            id="registration-loading",
+                            type="circle",
+                            children=[
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            [
+                                                html.Div(
+                                                    id="registration-thumbnail-grid",
+                                                    className="d-flex flex-wrap gap-2 mb-3",
+                                                )
+                                            ]
                                         )
                                     ]
-                                )
-                            ]
+                                ),
+                            ],
+                        ),
+                        dcc.Loading(
+                            id="viewers-loading",
+                            type="circle",
+                            children=[
+                                dbc.Row(
+                                    [
+                                        # Fixed viewer column
+                                        dbc.Col(
+                                            [
+                                                html.Div(
+                                                    id="fixed-image-info",
+                                                    className="image-info mb-2",
+                                                ),
+                                                html.Div(
+                                                    className="viewer-container",
+                                                    children=[
+                                                        html.Div(
+                                                            "FIXED",
+                                                            className="viewer-label",
+                                                        ),
+                                                        fixed_image_viewer,
+                                                    ],
+                                                ),
+                                            ],
+                                            width=6,
+                                        ),
+                                        # Moving viewer column
+                                        dbc.Col(
+                                            [
+                                                html.Div(
+                                                    id="moving-image-info",
+                                                    className="image-info mb-2",
+                                                ),
+                                                html.Div(
+                                                    className="viewer-container",
+                                                    children=[
+                                                        html.Div(
+                                                            "MOVING",
+                                                            className="viewer-label",
+                                                        ),
+                                                        moving_image_viewer,
+                                                    ],
+                                                ),
+                                            ],
+                                            width=6,
+                                        ),
+                                    ],
+                                    className="g-2",
+                                ),
+                            ],
                         ),
                     ],
                     className="mb-2",
                 )
             ]
-        ),
-        # Viewers Row
-        dbc.Row(
-            [
-                dbc.Col([fixed_image_viewer], width=6),
-                dbc.Col([moving_image_viewer], width=6),
-            ],
-            className="g-2",
         ),
         thumbnail_debug_modal,
     ],
@@ -393,286 +458,7 @@ def update_registration_thumbnails(slideList, selected_block):
     return thumbnail_cards
 
 
-def get_thumbnail_image(item_id, width=1024):
-    """Fetch thumbnail image from DSA and resize to specified width"""
-    url = f"{DSA_BASE_URL}/item/{item_id}/tiles/thumbnail?token={token_info['_id']}&width={width}"
-    response = requests.get(url)
-    img = Image.open(BytesIO(response.content))
-    img_np = np.array(img)
-    # Convert to grayscale if it's not already
-    if len(img_np.shape) == 3:
-        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    return img_np
-
-
-def find_tissue_contours(img_array, method="canny"):
-    """Find tissue boundaries using various edge/contour detection methods"""
-    # Convert BGR to RGB if needed
-    if len(img_array.shape) == 2:
-        img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
-
-    # Convert to HSV for better tissue segmentation
-    hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
-
-    if method == "canny":
-        # Use Canny edge detection
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 50, 150)
-        return edges
-
-    elif method == "threshold":
-        # Use saturation channel for tissue detection
-        _, thresh = cv2.threshold(hsv[:, :, 1], 50, 255, cv2.THRESH_BINARY)
-        return thresh
-
-    elif method == "adaptive":
-        # Adaptive thresholding on grayscale
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        # Invert the image so tissue (darker regions) becomes white
-        gray = cv2.bitwise_not(gray)
-        # Apply adaptive threshold
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        # Apply morphological operations to clean up the mask
-        kernel = np.ones((3, 3), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        return thresh
-
-    elif method == "watershed":
-        # Watershed segmentation
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        # Invert for better tissue detection
-        gray = cv2.bitwise_not(gray)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Noise removal
-        kernel = np.ones((3, 3), np.uint8)
-        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-
-        # Sure background area
-        sure_bg = cv2.dilate(opening, kernel, iterations=3)
-
-        # Finding sure foreground area
-        dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-        _, sure_fg = cv2.threshold(dist_transform, 0.7 * dist_transform.max(), 255, 0)
-
-        return sure_fg.astype(np.uint8)
-
-
-def find_matching_points(fixed_img, moving_img, method="orb", max_points=8):
-    debug_info = {
-        "all_keypoints_fixed": [],
-        "all_keypoints_moving": [],
-        "initial_matches": [],
-        "ransac_inliers": [],
-        "stats": {},
-    }
-
-    if method in ["orb", "sift", "akaze", "brisk"]:
-        try:
-            # Ensure images are properly preprocessed
-            if len(fixed_img.shape) == 3:
-                fixed_gray = cv2.cvtColor(fixed_img, cv2.COLOR_RGB2GRAY)
-                moving_gray = cv2.cvtColor(moving_img, cv2.COLOR_RGB2GRAY)
-            else:
-                fixed_gray = fixed_img
-                moving_gray = moving_img
-
-            # Enhance contrast
-            fixed_gray = cv2.equalizeHist(fixed_gray)
-            moving_gray = cv2.equalizeHist(moving_gray)
-
-            # Initialize detector with appropriate parameters
-            if method == "orb":
-                detector = cv2.ORB_create(nfeatures=500)
-                norm_type = cv2.NORM_HAMMING
-                crossCheck = True
-            elif method == "sift":
-                detector = cv2.SIFT_create(nfeatures=500)
-                norm_type = cv2.NORM_L2
-                crossCheck = False
-            elif method == "akaze":
-                detector = cv2.AKAZE_create(
-                    descriptor_type=cv2.AKAZE_DESCRIPTOR_MLDB,
-                    descriptor_size=0,  # Full size
-                    descriptor_channels=3,
-                    threshold=0.001,  # Lower threshold to detect more features
-                    nOctaves=4,
-                    nOctaveLayers=4,
-                )
-                norm_type = cv2.NORM_HAMMING
-                crossCheck = True
-            elif method == "brisk":
-                detector = cv2.BRISK_create()
-                norm_type = cv2.NORM_HAMMING
-                crossCheck = True
-
-            # Find keypoints and descriptors
-            kp1, des1 = detector.detectAndCompute(fixed_gray, None)
-            kp2, des2 = detector.detectAndCompute(moving_gray, None)
-
-            print(
-                f"{method.upper()} detected keypoints - fixed: {len(kp1) if kp1 else 0}, moving: {len(kp2) if kp2 else 0}"
-            )
-
-            if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
-                print(f"Not enough keypoints found for {method}")
-                return [], [], debug_info
-
-            # Store all keypoints for visualization
-            debug_info["all_keypoints_fixed"] = [
-                (int(kp.pt[0]), int(kp.pt[1])) for kp in kp1
-            ]
-            debug_info["all_keypoints_moving"] = [
-                (int(kp.pt[0]), int(kp.pt[1])) for kp in kp2
-            ]
-            debug_info["stats"]["total_keypoints"] = (len(kp1), len(kp2))
-
-            # Match features based on method
-            if method == "sift":
-                bf = cv2.BFMatcher(norm_type)
-                raw_matches = bf.knnMatch(des1, des2, k=2)
-                matches = []
-                for m, n in raw_matches:
-                    if m.distance < 0.75 * n.distance:
-                        matches.append(m)
-            else:
-                bf = cv2.BFMatcher(norm_type, crossCheck=crossCheck)
-                matches = bf.match(des1, des2)
-
-            if len(matches) < 4:
-                print(f"Not enough matches found for {method}: {len(matches)}")
-                return [], [], debug_info
-
-            # Sort matches by distance
-            matches = sorted(matches, key=lambda x: x.distance)
-
-            print(f"Total matches found for {method}: {len(matches)}")
-
-            # Take top matches (more than needed for filtering)
-            num_matches = min(len(matches), max_points * 4)
-            top_matches = matches[:num_matches]
-
-            # Store initial matches for debug
-            debug_info["initial_matches"] = [
-                (kp1[m.queryIdx].pt, kp2[m.trainIdx].pt) for m in top_matches
-            ]
-            debug_info["stats"]["total_matches"] = len(matches)
-
-            # Convert matches to point pairs
-            fixed_points = []
-            moving_points = []
-            for match in top_matches:
-                fixed_points.append(kp1[match.queryIdx].pt)
-                moving_points.append(kp2[match.trainIdx].pt)
-
-            return fixed_points, moving_points, debug_info
-
-        except Exception as e:
-            print(f"Error in {method} matching: {str(e)}")
-            import traceback
-
-            traceback.print_exc()
-            return [], [], debug_info
-
-    # For non-feature detection methods (tissue detection)
-    else:
-        try:
-            # ... existing tissue detection code ...
-            return fixed_points, moving_points, debug_info
-        except Exception as e:
-            print(f"Error in {method} detection: {str(e)}")
-            return [], [], debug_info
-
-
-def scale_points_to_full_size(points, thumbnail_size, full_size):
-    """
-    Scale points from thumbnail coordinates to full image coordinates
-    Explicitly handle both width and height
-    """
-    # thumbnail_size is (height, width) from numpy shape
-    # full_size has 'width' and 'height' keys
-
-    print(
-        f"Scaling points from thumbnail size {thumbnail_size} to full size {full_size}"
-    )
-
-    # Calculate scaling factors for both dimensions
-    scale_x = (
-        full_size["width"] / thumbnail_size[1]
-    )  # width is second dimension in shape
-    scale_y = (
-        full_size["height"] / thumbnail_size[0]
-    )  # height is first dimension in shape
-
-    print(f"Scale factors - x: {scale_x}, y: {scale_y}")
-
-    scaled_points = []
-    for x, y in points:
-        scaled_x = int(x * scale_x)
-        scaled_y = int(y * scale_y)
-        scaled_points.append((scaled_x, scaled_y))
-        print(f"Point scaled from ({x}, {y}) to ({scaled_x}, {scaled_y})")
-
-    return scaled_points
-
-
-# Add a function to filter matches based on geometric consistency
-def filter_matches_geometric(fixed_points, moving_points, num_points, debug_info=None):
-    """
-    Filter matches using geometric constraints
-    Args:
-        fixed_points: list of points from fixed image
-        moving_points: list of points from moving image
-        num_points: number of points to return
-        debug_info: dictionary for storing debug information
-    Returns:
-        filtered fixed points, filtered moving points, updated debug_info
-    """
-    if debug_info is None:
-        debug_info = {}
-
-    if len(fixed_points) < num_points or len(moving_points) < num_points:
-        return fixed_points, moving_points, debug_info
-
-    print(f"Starting geometric filtering with {len(fixed_points)} points")
-
-    # Convert to numpy arrays
-    fixed_arr = np.array(fixed_points)
-    moving_arr = np.array(moving_points)
-
-    # Find homography matrix
-    H, mask = cv2.findHomography(fixed_arr, moving_arr, cv2.RANSAC, 5.0)
-
-    if H is None:
-        print("No homography found")
-        return fixed_points[:num_points], moving_points[:num_points], debug_info
-
-    # Get inliers
-    inliers = mask.ravel().tolist()
-    print(f"RANSAC found {sum(inliers)} inlier matches")
-
-    # Filter points using mask
-    fixed_filtered = []
-    moving_filtered = []
-    for i, inlier in enumerate(inliers):
-        if inlier:
-            fixed_filtered.append(fixed_points[i])
-            moving_filtered.append(moving_points[i])
-
-    # Take the best num_points
-    if len(fixed_filtered) > num_points:
-        fixed_filtered = fixed_filtered[:num_points]
-        moving_filtered = moving_filtered[:num_points]
-
-    print(f"Final number of points after geometric filtering: {len(fixed_filtered)}")
-    return fixed_filtered, moving_filtered, debug_info
-
-
-# Callback to set up images and generate fiducial points
+# Simplified callbacks that use the imported functions
 @callback(
     [
         Output("fixed-image-viewer", "tileSources"),
@@ -684,7 +470,7 @@ def filter_matches_geometric(fixed_points, moving_points, num_points, debug_info
         Input("caseSlideSet_store", "data"),
         Input("registration_blockId", "data"),
         Input("feature-detection-method", "value"),
-        Input("num-points-slider", "value"),
+        Input("num-points-selector", "value"),
         Input("registration-constraints", "value"),
         Input("thumbnail-width-selector", "value"),
     ],
@@ -956,186 +742,6 @@ def update_thumbnail_display(slideList, selected_block):
         return "", ""
 
 
-def filter_points_with_constraints(
-    fixed_points, moving_points, constraints, image_bounds
-):
-    """Apply pathology-specific constraints to point pairs"""
-    if not constraints or not image_bounds:
-        return fixed_points, moving_points
-
-    try:
-        valid_pairs = []
-        for i in range(len(fixed_points)):
-            fp = np.array(fixed_points[i])
-            mp = np.array(moving_points[i])
-
-            valid = True
-            f_center = np.array([image_bounds["width"] / 2, image_bounds["height"] / 2])
-            m_center = f_center  # Assuming same size images
-
-            if "limit_rotation" in constraints:
-                f_angle = np.arctan2(fp[1] - f_center[1], fp[0] - f_center[0])
-                m_angle = np.arctan2(mp[1] - m_center[1], mp[0] - m_center[0])
-                angle_diff = np.abs(np.degrees(f_angle - m_angle))
-                if angle_diff > 10:  # 10 degree threshold
-                    valid = False
-
-            if "similar_scale" in constraints:
-                f_dist = np.linalg.norm(fp - f_center)
-                m_dist = np.linalg.norm(mp - m_center)
-                scale_diff = abs(f_dist - m_dist) / f_dist
-                if scale_diff > 0.1:  # 10% threshold
-                    valid = False
-
-            if "center_aligned" in constraints:
-                center_threshold = (
-                    min(image_bounds["width"], image_bounds["height"]) * 0.2
-                )
-                if np.linalg.norm((fp - f_center) - (mp - m_center)) > center_threshold:
-                    valid = False
-
-            if "preserve_shape" in constraints and len(valid_pairs) >= 2:
-                prev_f = np.array(fixed_points[valid_pairs[-1]])
-                prev_m = np.array(moving_points[valid_pairs[-1]])
-                f_dist = np.linalg.norm(fp - prev_f)
-                m_dist = np.linalg.norm(mp - prev_m)
-                if abs(f_dist - m_dist) / f_dist > 0.1:  # 10% threshold
-                    valid = False
-
-            if valid:
-                valid_pairs.append(i)
-
-        filtered_fixed = [fixed_points[i] for i in valid_pairs]
-        filtered_moving = [moving_points[i] for i in valid_pairs]
-
-        print(f"Points after constraint filtering: {len(filtered_fixed)}")
-        return filtered_fixed, filtered_moving
-
-    except Exception as e:
-        print(f"Error in constraint filtering: {str(e)}")
-        return fixed_points, moving_points
-
-
-def get_slides_for_registration(slideList, selected_block):
-    """Get the fixed (HE) and moving slides for registration from a slide list"""
-    if not slideList or not selected_block:
-        return None, None
-
-    filtered_slides = [
-        slide
-        for slide in slideList
-        if slide.get("meta", {}).get("npSchema", {}).get("blockID") == selected_block
-    ]
-
-    he_slide = next(
-        (
-            slide
-            for slide in filtered_slides
-            if slide.get("meta", {}).get("npSchema", {}).get("stainID", "").upper()
-            == "HE"
-        ),
-        None,
-    )
-    moving_slide = next(
-        (
-            slide
-            for slide in filtered_slides
-            if slide.get("meta", {}).get("npSchema", {}).get("stainID", "").upper()
-            != "HE"
-        ),
-        None,
-    )
-
-    return he_slide, moving_slide
-
-
-def create_registration_points(
-    fixed_img, moving_img, method, num_points, constraints=None, image_bounds=None
-):
-    """
-    Main registration point generation function that handles different methods
-    Returns: (fixed_points, moving_points)
-    """
-    try:
-        # Get initial matches with double the requested points for better filtering
-        fixed_points, moving_points, debug_info = find_matching_points(
-            fixed_img, moving_img, method=method, max_points=num_points * 2
-        )
-
-        print(f"Initial points found: {len(fixed_points)}")
-
-        # Filter points if we have enough
-        if len(fixed_points) >= 4 and len(moving_points) >= 4:
-            fixed_points, moving_points, debug_info = filter_matches_geometric(
-                fixed_points, moving_points, num_points, debug_info
-            )
-
-            print(f"Points after geometric filtering: {len(fixed_points)}")
-
-            # Apply additional constraints if specified
-            if constraints and image_bounds:
-                fixed_points, moving_points = filter_points_with_constraints(
-                    fixed_points, moving_points, constraints, image_bounds
-                )
-
-        return fixed_points, moving_points, debug_info
-
-    except Exception as e:
-        print(f"Error in registration point creation: {str(e)}")
-        import traceback
-
-        traceback.print_exc()
-        return [], [], {}
-
-
-def create_geojson_features(points, colors, prefix="fiducial"):
-    """Create GeoJSON features for a set of points with colors"""
-    return [
-        {
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [x, y]},
-            "properties": {
-                "radius": 5,
-                "fillColor": color,
-                "strokeColor": color,
-                "name": f"{prefix}_{i}",
-            },
-        }
-        for i, ((x, y), color) in enumerate(zip(points, colors))
-    ]
-
-
-def normalize_image_sizes(fixed_img, moving_img):
-    """
-    Resize images to have the same dimensions while preserving aspect ratio
-    Returns: (normalized_fixed, normalized_moving, scale_factors)
-    """
-    # Get original dimensions
-    fixed_h, fixed_w = fixed_img.shape[:2]
-    moving_h, moving_w = moving_img.shape[:2]
-
-    print(
-        f"Original dimensions - fixed: {fixed_h}x{fixed_w}, moving: {moving_h}x{moving_w}"
-    )
-
-    # Calculate target size (use smaller dimensions to prevent upscaling)
-    target_w = min(fixed_w, moving_w)
-    target_h = min(fixed_h, moving_h)
-
-    # Calculate scaling factors for later use
-    fixed_scale = {"x": fixed_w / target_w, "y": fixed_h / target_h}
-    moving_scale = {"x": moving_w / target_w, "y": moving_h / target_h}
-
-    print(f"Target dimensions: {target_h}x{target_w}")
-    print(f"Scale factors - fixed: {fixed_scale}, moving: {moving_scale}")
-
-    # Resize images
-    fixed_resized = cv2.resize(fixed_img, (target_w, target_h))
-    moving_resized = cv2.resize(moving_img, (target_w, target_h))
-
-    return fixed_resized, moving_resized, (fixed_scale, moving_scale)
-
-
 # Add callbacks to toggle the collapses
 @callback(
     Output("registration-thumbnails-collapse", "is_open"),
@@ -1306,3 +912,75 @@ def update_moving_debug_content(moving_paper):
         hover=True,
         size="sm",
     )
+
+
+# Optional: Add a text indicator for more explicit status
+@callback(
+    Output("registration-loading", "children"),
+    [Input("feature-detection-method", "value"), Input("num-points-selector", "value")],
+    prevent_initial_call=True,
+)
+def update_loading_status(method, num_points):
+    """Show loading status while registration is running"""
+    # This will trigger the loading spinner
+    time.sleep(0.1)  # Small delay to ensure spinner shows
+    return [
+        dbc.Row(
+            [
+                dbc.Col(
+                    [
+                        html.Div(
+                            id="registration-thumbnail-grid",
+                            className="d-flex flex-wrap gap-2 mb-3",
+                        )
+                    ]
+                )
+            ]
+        )
+    ]
+
+
+@callback(
+    [Output("fixed-image-info", "children"), Output("moving-image-info", "children")],
+    [
+        Input("fixed-image-viewer", "tileSources"),
+        Input("moving-image-viewer", "tileSources"),
+    ],
+)
+def update_image_info(fixed_tiles, moving_tiles):
+    """Update the image information display"""
+    if not fixed_tiles or not moving_tiles:
+        return "", ""
+
+    def get_girder_info(tiles):
+        if isinstance(tiles, list) and len(tiles) > 0:
+            # Extract itemId from the tileSource URL
+            tile_source = tiles[0].get("tileSource", "")
+            item_id = tile_source.split("/item/")[1].split("/")[0]
+
+            # Get tile info from Girder
+            try:
+                tile_info = gc.get(f"item/{item_id}/tiles")
+                return [
+                    html.Div(
+                        f"Size: {tile_info.get('sizeX', 'N/A')}×{tile_info.get('sizeY', 'N/A')}  |  "
+                        f"Resolution: {tile_info.get('mm_x', 'N/A')}  |  "
+                        f"Magnification: {tile_info.get('magnification', 'N/A')}  |  "
+                        f"Source: {item_id}  |  "
+                        f"Levels: {tile_info.get('levels', 'N/A')}",
+                        style={
+                            "whiteSpace": "nowrap",
+                            "overflow": "hidden",
+                            "textOverflow": "ellipsis",
+                        },
+                    )
+                ]
+            except Exception as e:
+                print(f"Error getting tile info: {e}")
+                return ["Error getting tile info"]
+        return ["No tile information available"]
+
+    fixed_info = get_girder_info(fixed_tiles)
+    moving_info = get_girder_info(moving_tiles)
+
+    return fixed_info, moving_info
