@@ -21,10 +21,9 @@ RUN chmod -R 777 /home/app
 
 ## It's possible if I don't build on a MAC I may need not this.. TODO is change to linux/amd64 build
 RUN apt-get update
-RUN apt install libgl1-mesa-glx -y
-RUN apt-get install -y libglib2.0-0 libsm6 libxrender1 libxext6
+RUN apt-get install -y libglib2.0-0 libsm6 libxrender1 libxext6 libgl1-mesa-glx 
 USER app
-
+RUN pip install dash_paperdragon==0.1.11
 # Run the web service on container startup. Here we use the gunicorn
 # webserver, with one worker process and 8 threads.
 # For environments with multiple CPU cores, increase the number of workers

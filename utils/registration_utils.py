@@ -422,10 +422,14 @@ def create_thumbnail_card(item):
 #     )
 
 
-def create_geojson_features(points, colors, prefix="fiducial"):
-    """Create GeoJSON features for a set of points with colors"""
-    return [
-        {
+def create_geojson_features(points, colors, prefix="point", layer_idx=None):
+    """Create GeoJSON features for a set of points with colors and optional layer index"""
+    features = []
+    # Always set layer_idx to 0 for fixed points if not specified
+    layer_idx = 0 if layer_idx is None else layer_idx
+
+    for i, ((x, y), color) in enumerate(zip(points, colors)):
+        feature = {
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [x, y]},
             "properties": {
@@ -433,10 +437,12 @@ def create_geojson_features(points, colors, prefix="fiducial"):
                 "fillColor": color,
                 "strokeColor": color,
                 "name": f"{prefix}_{i}",
+                "rescale": {"strokeWidth": 2},
+                "layerIdx": layer_idx,  # Now always included
             },
         }
-        for i, ((x, y), color) in enumerate(zip(points, colors))
-    ]
+        features.append(feature)
+    return features
 
 
 def scale_points_to_full_size(points, thumbnail_size, full_size):

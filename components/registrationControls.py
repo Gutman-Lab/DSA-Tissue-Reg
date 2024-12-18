@@ -473,10 +473,12 @@ def update_registration_thumbnails(slideList, selected_block):
         Output("fixed-image-viewer", "inputToPaper"),
         Output("moving-image-viewer", "tileSources"),
         Output("moving-image-viewer", "inputToPaper"),
-        # Add outputs for the control values
         Output("moving-image-x-offset", "value"),
         Output("moving-image-y-offset", "value"),
         Output("moving-image-rotation", "value"),
+        Output("fixed-image-info", "children"),
+        Output("moving-image-info", "children"),
+        Output("moving-image-metadata", "data"),
     ],
     [
         Input("caseSlideSet_store", "data"),
@@ -498,15 +500,13 @@ def setup_registration_images(
     # Get slides
     he_slide, moving_slide = get_slides_for_registration(slideList, selected_block)
     if not he_slide or not moving_slide:
-        return [], {}, [], {}, 0, 0, 0
+        empty_return = [], {}, [], {}, 0, 0, 0, [], [], {}
+        return empty_return
 
     # Get image dimensions for both slides
     try:
         he_tiles_info = gc.get(f"item/{he_slide['_id']}/tiles")
         moving_tiles_info = gc.get(f"item/{moving_slide['_id']}/tiles")
-
-        print(f"HE tiles info: {he_tiles_info}")
-        print(f"Moving tiles info: {moving_tiles_info}")
 
         fixed_bounds = {
             "width": he_tiles_info.get("sizeX", 10000),
@@ -517,335 +517,278 @@ def setup_registration_images(
             "height": moving_tiles_info.get("sizeY", 10000),
         }
 
-        print(f"Fixed bounds: {fixed_bounds}")
-        print(f"Moving bounds: {moving_bounds}")
+        # Create tile sources with correct dimensions
+        fixed_tile_source = [
+            {
+                "tileSource": f"{DSA_BASE_URL}/item/{he_slide['_id']}/tiles/dzi.dzi?token={token_info['_id']}",
+                "width": fixed_bounds["width"],
+                # "height": fixed_bounds["height"],  # Add height to tile source
+            }
+        ]
+        moving_tile_source = [
+            {
+                "tileSource": f"{DSA_BASE_URL}/item/{moving_slide['_id']}/tiles/dzi.dzi?token={token_info['_id']}",
+                "width": moving_bounds["width"],
+                # "height": moving_bounds["height"],  # Add height to tile source
+            }
+        ]
+
+        try:
+            # Get thumbnails with specified width
+            fixed_thumb = get_thumbnail_image(he_slide["_id"], width=thumbnail_width)
+            moving_thumb = get_thumbnail_image(
+                moving_slide["_id"], width=thumbnail_width
+            )
+
+            if fixed_thumb is None or moving_thumb is None:
+                print("Failed to retrieve thumbnails")
+                return (
+                    fixed_tile_source,
+                    {"actions": []},
+                    moving_tile_source,
+                    {"actions": []},
+                    0,  # Default X offset
+                    0,  # Default Y offset
+                    0,  # Default rotation
+                    [],
+                    [],
+                    [],
+                )
+
+            print(f"Using thumbnail width: {thumbnail_width}")
+            print(
+                f"Thumbnail shapes - fixed: {fixed_thumb.shape}, moving: {moving_thumb.shape}"
+            )
+
+            # Normalize image sizes for feature detection
+            norm_fixed, norm_moving, (fixed_scale, moving_scale) = (
+                normalize_image_sizes(fixed_thumb, moving_thumb)
+            )
+
+            print(
+                f"Normalized shapes - fixed: {norm_fixed.shape}, moving: {norm_moving.shape}"
+            )
+            print(f"Scale factors - fixed: {fixed_scale}, moving: {moving_scale}")
+
+            # Generate registration points on normalized images
+            fixed_points, moving_points, debug_info = create_registration_points(
+                norm_fixed,
+                norm_moving,
+                detection_method,
+                num_points,
+                constraints,
+                fixed_bounds,
+            )
+
+            if fixed_points and moving_points:
+                # Print original points
+                print("Original fixed points:", fixed_points)
+                print("Original moving points:", moving_points)
+
+                # Scale fixed points back to original fixed image size
+                fixed_points = [
+                    (x * fixed_scale["x"], y * fixed_scale["y"])
+                    for x, y in fixed_points
+                ]
+                moving_points = [
+                    (x * moving_scale["x"], y * moving_scale["y"])
+                    for x, y in moving_points
+                ]
+
+                print("After scaling to original size:")
+                print("Fixed points:", fixed_points)
+                print("Moving points:", moving_points)
+
+                # Scale to full image coordinates
+                fixed_points = scale_points_to_full_size(
+                    fixed_points, fixed_thumb.shape, fixed_bounds
+                )
+                moving_points = scale_points_to_full_size(
+                    moving_points, moving_thumb.shape, moving_bounds
+                )
+
+                print("After scaling to full size:")
+                print("Fixed points:", fixed_points)
+                print("Moving points:", moving_points)
+
+                # Convert points to numpy arrays for transformation calculation
+                fixed_np = np.float32(fixed_points)
+                moving_np = np.float32(moving_points)
+
+                # Calculate transformation matrix
+                transform_matrix = cv2.estimateAffinePartial2D(moving_np, fixed_np)[0]
+
+                # Extract transformation parameters
+                scale = np.sqrt(
+                    transform_matrix[0, 0] ** 2 + transform_matrix[0, 1] ** 2
+                )
+                rotation = np.degrees(
+                    np.arctan2(transform_matrix[1, 0], transform_matrix[0, 0])
+                )
+                x_offset = transform_matrix[0, 2]
+                y_offset = transform_matrix[1, 2]
+
+                # Generate colors and create GeoJSON features
+                colors = generate_distinct_colors(len(fixed_points))
+                fixed_items = create_geojson_features(fixed_points, colors, "fixed")
+                moving_items = create_geojson_features(
+                    moving_points, colors, "moving", layer_idx=1
+                )
+
+                # print("=== Successful Feature Matching Return ===")
+                # print("Fixed Items:", fixed_items)
+                # print("Number of items:", len(fixed_items))
+                # print(
+                #     "First item example:", fixed_items[0] if fixed_items else "No items"
+                # )
+                # print(
+                #     "Paper Input Structure:",
+                #     {"actions": [{"type": "drawItems", "itemList": fixed_items}]},
+                # )
+                # print("=====================================")
+
+                return (
+                    fixed_tile_source,
+                    {"actions": [{"type": "drawItems", "itemList": fixed_items}]},
+                    moving_tile_source,
+                    {"actions": [{"type": "drawItems", "itemList": moving_items}]},
+                    x_offset,  # X offset value
+                    y_offset,  # Y offset value
+                    rotation,  # Rotation value
+                    [
+                        html.Div(
+                            f"Size: {he_tiles_info.get('sizeX', 'N/A')}×{he_tiles_info.get('sizeY', 'N/A')}  |  "
+                            f"Magnification: {he_tiles_info.get('magnification', 'N/A')}"
+                        )
+                    ],
+                    [
+                        html.Div(
+                            f"Size: {moving_tiles_info.get('sizeX', 'N/A')}×{moving_tiles_info.get('sizeY', 'N/A')}  |  "
+                            f"Magnification: {moving_tiles_info.get('magnification', 'N/A')}"
+                        )
+                    ],
+                    {
+                        "sizeX": moving_tiles_info.get("sizeX", 1.0),
+                        "sizeY": moving_tiles_info.get("sizeY", 1.0),
+                        "magnification": moving_tiles_info.get("magnification", "N/A"),
+                    },
+                )
+
+        except Exception as e:
+            print(f"Error in feature matching: {str(e)}")
+            import traceback
+
+            traceback.print_exc()
+
+        # Return defaults if registration fails
+        return (
+            fixed_tile_source,
+            {"actions": []},
+            moving_tile_source,
+            {"actions": []},
+            0,  # Default X offset
+            0,  # Default Y offset
+            0,  # Default rotation
+            [],
+            [],
+            {},
+        )
 
     except Exception as e:
         print(f"Error getting tiles info: {str(e)}")
         fixed_bounds = {"width": 10000, "height": 10000}
         moving_bounds = fixed_bounds.copy()
 
-    # Create tile sources with correct dimensions
-    fixed_tile_source = [
-        {
-            "tileSource": f"{DSA_BASE_URL}/item/{he_slide['_id']}/tiles/dzi.dzi?token={token_info['_id']}",
-            "width": fixed_bounds["width"],
-            "height": fixed_bounds["height"],  # Add height to tile source
-        }
-    ]
-    moving_tile_source = [
-        {
-            "tileSource": f"{DSA_BASE_URL}/item/{moving_slide['_id']}/tiles/dzi.dzi?token={token_info['_id']}",
-            "width": moving_bounds["width"],
-            "height": moving_bounds["height"],  # Add height to tile source
-        }
-    ]
-
-    try:
-        # Get thumbnails with specified width
-        fixed_thumb = get_thumbnail_image(he_slide["_id"], width=thumbnail_width)
-        moving_thumb = get_thumbnail_image(moving_slide["_id"], width=thumbnail_width)
-
-        if fixed_thumb is None or moving_thumb is None:
-            print("Failed to retrieve thumbnails")
-            return (
-                fixed_tile_source,
-                {"actions": []},
-                moving_tile_source,
-                {"actions": []},
-                0,  # Default X offset
-                0,  # Default Y offset
-                0,  # Default rotation
-            )
-
-        print(f"Using thumbnail width: {thumbnail_width}")
-        print(
-            f"Thumbnail shapes - fixed: {fixed_thumb.shape}, moving: {moving_thumb.shape}"
-        )
-
-        # Normalize image sizes for feature detection
-        norm_fixed, norm_moving, (fixed_scale, moving_scale) = normalize_image_sizes(
-            fixed_thumb, moving_thumb
-        )
-
-        print(
-            f"Normalized shapes - fixed: {norm_fixed.shape}, moving: {norm_moving.shape}"
-        )
-        print(f"Scale factors - fixed: {fixed_scale}, moving: {moving_scale}")
-
-        # Generate registration points on normalized images
-        fixed_points, moving_points, debug_info = create_registration_points(
-            norm_fixed,
-            norm_moving,
-            detection_method,
-            num_points,
-            constraints,
-            fixed_bounds,
-        )
-
-        if fixed_points and moving_points:
-            # Print original points
-            print("Original fixed points:", fixed_points)
-            print("Original moving points:", moving_points)
-
-            # Scale fixed points back to original fixed image size
-            fixed_points = [
-                (x * fixed_scale["x"], y * fixed_scale["y"]) for x, y in fixed_points
-            ]
-            moving_points = [
-                (x * moving_scale["x"], y * moving_scale["y"]) for x, y in moving_points
-            ]
-
-            print("After scaling to original size:")
-            print("Fixed points:", fixed_points)
-            print("Moving points:", moving_points)
-
-            # Scale to full image coordinates
-            fixed_points = scale_points_to_full_size(
-                fixed_points, fixed_thumb.shape, fixed_bounds
-            )
-            moving_points = scale_points_to_full_size(
-                moving_points, moving_thumb.shape, moving_bounds
-            )
-
-            print("After scaling to full size:")
-            print("Fixed points:", fixed_points)
-            print("Moving points:", moving_points)
-
-            # Convert points to numpy arrays for transformation calculation
-            fixed_np = np.float32(fixed_points)
-            moving_np = np.float32(moving_points)
-
-            # Calculate transformation matrix
-            transform_matrix = cv2.estimateAffinePartial2D(moving_np, fixed_np)[0]
-
-            # Extract transformation parameters
-            scale = np.sqrt(transform_matrix[0, 0] ** 2 + transform_matrix[0, 1] ** 2)
-            rotation = np.degrees(
-                np.arctan2(transform_matrix[1, 0], transform_matrix[0, 0])
-            )
-            x_offset = transform_matrix[0, 2]
-            y_offset = transform_matrix[1, 2]
-
-            # Generate colors and create GeoJSON features
-            colors = generate_distinct_colors(len(fixed_points))
-            fixed_items = create_geojson_features(fixed_points, colors, "fixed")
-            moving_items = create_geojson_features(moving_points, colors, "moving")
-
-            return (
-                fixed_tile_source,
-                {"actions": [{"type": "drawItems", "itemList": fixed_items}]},
-                moving_tile_source,
-                {"actions": [{"type": "drawItems", "itemList": moving_items}]},
-                x_offset,  # X offset value
-                y_offset,  # Y offset value
-                rotation,  # Rotation value
-            )
-
-    except Exception as e:
-        print(f"Error in feature matching: {str(e)}")
-        import traceback
-
-        traceback.print_exc()
-
-    # Return defaults if registration fails
-    return (
-        fixed_tile_source,
-        {"actions": []},
-        moving_tile_source,
-        {"actions": []},
-        0,  # Default X offset
-        0,  # Default Y offset
-        0,  # Default rotation
-    )
-
-
-# Add new callback for metadata
-@callback(
-    [
-        Output("fixed-image-metadata", "children"),
-        Output("moving-image-metadata", "children"),
-    ],
-    [Input("caseSlideSet_store", "data"), Input("registration_blockId", "data")],
-)
-def update_image_metadata(slideList, selected_block):
-    if not slideList or not selected_block:
-        return [], []
-
-    filtered_slides = [
-        slide
-        for slide in slideList
-        if slide.get("meta", {}).get("npSchema", {}).get("blockID") == selected_block
-    ]
-
-    he_slide = next(
-        (
-            slide
-            for slide in filtered_slides
-            if slide.get("meta", {}).get("npSchema", {}).get("stainID", "").upper()
-            == "HE"
-        ),
-        None,
-    )
-    moving_slide = next(
-        (
-            slide
-            for slide in filtered_slides
-            if slide.get("meta", {}).get("npSchema", {}).get("stainID", "").upper()
-            != "HE"
-        ),
-        None,
-    )
-
-    if not he_slide or not moving_slide:
-        return [], []
-
-    def get_metadata_component(slide, title):
-        try:
-            tiles_info = gc.get(f"item/{slide['_id']}/tiles")
-            return html.Div(
-                [
-                    html.H5(title),
-                    html.P(f"Magnification: {tiles_info.get('magnification', 'N/A')}"),
-                    html.P(f"Size X: {tiles_info.get('sizeX', 'N/A')}"),
-                    html.P(f"Size Y: {tiles_info.get('sizeY', 'N/A')}"),
-                    html.P(f"mm_x: {tiles_info.get('mm_x', 'N/A')}"),
-                ]
-            )
-        except Exception as e:
-            return html.Div(
-                [html.H5(title), html.P(f"Error fetching metadata: {str(e)}")]
-            )
-
-    fixed_metadata = get_metadata_component(he_slide, "Fixed Image Metadata")
-    moving_metadata = get_metadata_component(moving_slide, "Moving Image Metadata")
-
-    return fixed_metadata, moving_metadata
-
-
-# Add new callback for thumbnail display
-@callback(
-    [
-        Output("fixed-thumbnail-display", "src"),
-        Output("moving-thumbnail-display", "src"),
-    ],
-    [
-        Input("caseSlideSet_store", "data"),
-        Input("registration_blockId", "data"),
-    ],
-)
-def update_thumbnail_display(slideList, selected_block):
-    if not slideList or not selected_block:
-        return "", ""
-
-    # Filter slides
-    filtered_slides = [
-        slide
-        for slide in slideList
-        if slide.get("meta", {}).get("npSchema", {}).get("blockID") == selected_block
-    ]
-
-    # Find HE and moving slides
-    he_slide = next(
-        (
-            slide
-            for slide in filtered_slides
-            if slide.get("meta", {}).get("npSchema", {}).get("stainID", "").upper()
-            == "HE"
-        ),
-        None,
-    )
-    moving_slide = next(
-        (
-            slide
-            for slide in filtered_slides
-            if slide.get("meta", {}).get("npSchema", {}).get("stainID", "").upper()
-            != "HE"
-        ),
-        None,
-    )
-
-    if not he_slide or not moving_slide:
-        return "", ""
-
-    try:
-        # Get thumbnails
-        fixed_thumb = get_thumbnail_image(he_slide["_id"])
-        moving_thumb = get_thumbnail_image(moving_slide["_id"])
-
-        # Convert to data URLs
-        fixed_url = array_to_data_url(fixed_thumb)
-        moving_url = array_to_data_url(moving_thumb)
-
-        return fixed_url, moving_url
-
-    except Exception as e:
-        print(f"Error displaying thumbnails: {str(e)}")
-        return "", ""
-
-
-# Add callbacks to toggle the collapses
-@callback(
-    Output("registration-thumbnails-collapse", "is_open"),
-    [Input("registration-thumbnails-collapse-button", "n_clicks")],
-    [State("registration-thumbnails-collapse", "is_open")],
-)
-def toggle_registration_thumbnails(n_clicks, is_open):
-    if n_clicks:
-        return not is_open
-    return is_open
-
-
-@callback(
-    Output("moving-thumbnails-collapse", "is_open"),
-    [Input("moving-thumbnails-collapse-button", "n_clicks")],
-    [State("moving-thumbnails-collapse", "is_open")],
-)
-def toggle_moving_thumbnails(n_clicks, is_open):
-    if n_clicks:
-        return not is_open
-    return is_open
-
-
-# Add callbacks to update the thumbnail content
-@callback(
-    Output("registration-thumbnails-content", "children"),
-    [Input("fixed-image-viewer", "inputToPaper")],
-)
-def update_registration_thumbnails(fixed_paper):
-    if not fixed_paper or "debug_info" not in fixed_paper:
-        return "No thumbnail data available"
-
-    debug_info = fixed_paper["debug_info"]
-    return html.Div(
-        [
-            html.P(
-                f"Total keypoints: {debug_info['stats'].get('total_keypoints', (0, 0))[0]}"
-            ),
-            html.P(f"Total matches: {debug_info['stats'].get('total_matches', 0)}"),
-            html.P(f"RANSAC inliers: {debug_info['stats'].get('ransac_inliers', 0)}"),
+        # Create tile sources with correct dimensions
+        fixed_tile_source = [
+            {
+                "tileSource": f"{DSA_BASE_URL}/item/{he_slide['_id']}/tiles/dzi.dzi?token={token_info['_id']}",
+                "width": fixed_bounds["width"],
+                # "height": fixed_bounds["height"],  # Add height to tile source
+            }
         ]
-    )
-
-
-@callback(
-    Output("moving-thumbnails-content", "children"),
-    [Input("moving-image-viewer", "inputToPaper")],
-)
-def update_moving_thumbnails(moving_paper):
-    if not moving_paper or "debug_info" not in moving_paper:
-        return "No thumbnail data available"
-
-    debug_info = moving_paper["debug_info"]
-    return html.Div(
-        [
-            html.P(
-                f"Total keypoints: {debug_info['stats'].get('total_keypoints', (0, 0))[1]}"
-            ),
-            html.P(f"Total matches: {debug_info['stats'].get('total_matches', 0)}"),
-            html.P(f"RANSAC inliers: {debug_info['stats'].get('ransac_inliers', 0)}"),
+        moving_tile_source = [
+            {
+                "tileSource": f"{DSA_BASE_URL}/item/{moving_slide['_id']}/tiles/dzi.dzi?token={token_info['_id']}",
+                "width": moving_bounds["width"],
+                # "height": moving_bounds["height"],  # Add height to tile source
+            }
         ]
-    )
+
+        # Return defaults if registration fails
+        return (
+            fixed_tile_source,
+            {"actions": []},
+            moving_tile_source,
+            {"actions": []},
+            0,  # Default X offset
+            0,  # Default Y offset
+            0,  # Default rotation
+            [],
+            [],
+            {},
+        )
+
+
+# # Add new callback for thumbnail display
+# @callback(
+#     [
+#         Output("fixed-thumbnail-display", "src"),
+#         Output("moving-thumbnail-display", "src"),
+#     ],
+#     [
+#         Input("caseSlideSet_store", "data"),
+#         Input("registration_blockId", "data"),
+#     ],
+# )
+# def update_thumbnail_display(slideList, selected_block):
+#     if not slideList or not selected_block:
+#         return "", ""
+
+#     # Filter slides
+#     filtered_slides = [
+#         slide
+#         for slide in slideList
+#         if slide.get("meta", {}).get("npSchema", {}).get("blockID") == selected_block
+#     ]
+
+#     # Find HE and moving slides
+#     he_slide = next(
+#         (
+#             slide
+#             for slide in filtered_slides
+#             if slide.get("meta", {}).get("npSchema", {}).get("stainID", "").upper()
+#             == "HE"
+#         ),
+#         None,
+#     )
+#     moving_slide = next(
+#         (
+#             slide
+#             for slide in filtered_slides
+#             if slide.get("meta", {}).get("npSchema", {}).get("stainID", "").upper()
+#             != "HE"
+#         ),
+#         None,
+#     )
+
+#     if not he_slide or not moving_slide:
+#         return "", ""
+
+#     try:
+#         # Get thumbnails
+#         fixed_thumb = get_thumbnail_image(he_slide["_id"])
+#         moving_thumb = get_thumbnail_image(moving_slide["_id"])
+
+#         # Convert to data URLs
+#         fixed_url = array_to_data_url(fixed_thumb)
+#         moving_url = array_to_data_url(moving_thumb)
+
+#         return fixed_url, moving_url
+
+#     except Exception as e:
+#         print(f"Error displaying thumbnails: {str(e)}")
+#         return "", ""
 
 
 # # Add callback for modal control
@@ -861,99 +804,6 @@ def update_moving_thumbnails(moving_paper):
 #     if n1 or n2:
 #         return not is_open
 #     return is_open
-
-
-# Add callbacks for modal content
-@callback(
-    Output("modal-fixed-debug-content", "children"),
-    [Input("fixed-image-viewer", "inputToPaper")],
-)
-def update_fixed_debug_content(fixed_paper):
-    if not fixed_paper or "debug_info" not in fixed_paper:
-        return "No debug information available"
-
-    debug_info = fixed_paper.get("debug_info", {})
-    return dbc.Table(
-        [
-            html.Tbody(
-                [
-                    html.Tr(
-                        [
-                            html.Td("Total Keypoints:"),
-                            html.Td(
-                                f"{debug_info.get('stats', {}).get('total_keypoints', (0, 0))[0]}"
-                            ),
-                        ]
-                    ),
-                    html.Tr(
-                        [
-                            html.Td("Total Matches:"),
-                            html.Td(
-                                f"{debug_info.get('stats', {}).get('total_matches', 0)}"
-                            ),
-                        ]
-                    ),
-                    html.Tr(
-                        [
-                            html.Td("RANSAC Inliers:"),
-                            html.Td(
-                                f"{debug_info.get('stats', {}).get('ransac_inliers', 0)}"
-                            ),
-                        ]
-                    ),
-                ]
-            )
-        ],
-        bordered=True,
-        hover=True,
-        size="sm",
-    )
-
-
-@callback(
-    Output("modal-moving-debug-content", "children"),
-    [Input("moving-image-viewer", "inputToPaper")],
-)
-def update_moving_debug_content(moving_paper):
-    if not moving_paper or "debug_info" not in moving_paper:
-        return "No debug information available"
-
-    debug_info = moving_paper.get("debug_info", {})
-    return dbc.Table(
-        [
-            html.Tbody(
-                [
-                    html.Tr(
-                        [
-                            html.Td("Total Keypoints:"),
-                            html.Td(
-                                f"{debug_info.get('stats', {}).get('total_keypoints', (0, 0))[1]}"
-                            ),
-                        ]
-                    ),
-                    html.Tr(
-                        [
-                            html.Td("Total Matches:"),
-                            html.Td(
-                                f"{debug_info.get('stats', {}).get('total_matches', 0)}"
-                            ),
-                        ]
-                    ),
-                    html.Tr(
-                        [
-                            html.Td("RANSAC Inliers:"),
-                            html.Td(
-                                f"{debug_info.get('stats', {}).get('ransac_inliers', 0)}"
-                            ),
-                        ]
-                    ),
-                ]
-            )
-        ],
-        bordered=True,
-        hover=True,
-        size="sm",
-    )
 
 
 # Optional: Add a text indicator for more explicit status
@@ -980,63 +830,6 @@ def update_loading_status(method, num_points):
             ]
         )
     ]
-
-
-@callback(
-    [
-        Output("fixed-image-info", "children"),
-        Output("moving-image-info", "children"),
-        Output("moving-image-metadata", "data"),
-    ],
-    [
-        Input("fixed-image-viewer", "tileSources"),
-        Input("moving-image-viewer", "tileSources"),
-    ],
-)
-def update_image_info(fixed_tiles, moving_tiles):
-    """Update the image information display and store metadata"""
-    if not fixed_tiles or not moving_tiles:
-        return "", "", {}
-
-    def get_girder_info(tiles):
-        if isinstance(tiles, list) and len(tiles) > 0:
-            tile_source = tiles[0].get("tileSource", "")
-            item_id = tile_source.split("/item/")[1].split("/")[0]
-
-            try:
-                tile_info = gc.get(f"item/{item_id}/tiles")
-                return tile_info
-            except Exception as e:
-                print(f"Error getting tile info: {e}")
-                return {}
-        return {}
-
-    fixed_info = get_girder_info(fixed_tiles)
-    moving_info = get_girder_info(moving_tiles)
-
-    # Store moving image metadata
-    moving_metadata = {
-        "sizeX": moving_info.get("sizeX", 1.0),
-        "sizeY": moving_info.get("sizeY", 1.0),
-        "magnification": moving_info.get("magnification", "N/A"),
-    }
-
-    # Create display info
-    fixed_display = [
-        html.Div(
-            f"Size: {fixed_info.get('sizeX', 'N/A')}×{fixed_info.get('sizeY', 'N/A')}  |  "
-            f"Magnification: {fixed_info.get('magnification', 'N/A')}"
-        )
-    ]
-
-    moving_display = [
-        html.Div(
-            f"Size: {moving_info.get('sizeX', 'N/A')}×{moving_info.get('sizeY', 'N/A')}  |  "
-            f"Magnification: {moving_info.get('magnification', 'N/A')}"
-        )
-    ]
-
-    return fixed_display, moving_display, moving_metadata
 
 
 @callback(
@@ -1074,6 +867,9 @@ def update_merged_viewer(fixed_tiles, moving_tiles, fixed_paper, moving_paper, o
             merged_paper["actions"].extend(fixed_paper["actions"])
         if moving_paper and "actions" in moving_paper:
             merged_paper["actions"].extend(moving_paper["actions"])
+
+        ### This should contain the merged points for both the fixed and moving images
+        print(merged_paper, "merged_paper items")
 
         # Get info for the merged viewer
         merged_info = [
