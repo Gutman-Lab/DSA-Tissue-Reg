@@ -7,6 +7,15 @@ from joblib import Memory
 import dash
 import dash_bootstrap_components as dbc
 
+from dash import DiskcacheManager
+
+# Diskcache for non-production apps when developing locally
+import diskcache
+
+cache = diskcache.Cache(".npCacheDir")
+background_callback_manager = DiskcacheManager(cache)
+
+
 # Imports that we might need later.
 # import pymongo
 # import socket

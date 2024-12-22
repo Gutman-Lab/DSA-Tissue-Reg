@@ -4,9 +4,14 @@ from dash import html, dcc
 import dash_bootstrap_components as dbc
 from components.caseViewer import caseViewer_layout
 from components.registrationControls import registrationControls_layout
+from settings import background_callback_manager
 
 # Initialize the Dash app
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
+    background_callback_manager=background_callback_manager,
+)
 
 # This is the line that was missing - expose the server variable
 server = app.server

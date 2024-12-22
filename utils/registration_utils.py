@@ -4,7 +4,7 @@ import colorsys
 import requests
 from io import BytesIO
 from PIL import Image
-from settings import gc, DSA_BASE_URL, token_info
+from settings import gc, DSA_BASE_URL, token_info, memory
 import dash_bootstrap_components as dbc
 
 
@@ -44,6 +44,7 @@ def generate_fiducial_points(image_bounds, num_points=8):
     return points[:num_points]
 
 
+@memory.cache
 def get_thumbnail_image(item_id, width=1024):
     """Fetch thumbnail image from DSA and resize to specified width"""
     url = f"{DSA_BASE_URL}/item/{item_id}/tiles/thumbnail?token={token_info['_id']}&width={width}"
@@ -92,6 +93,7 @@ def generate_distinct_colors(n):
     return colors
 
 
+@memory.cache
 def calculate_mutual_information(hist):
     """Calculate mutual information from a joint histogram"""
     # Convert histogram to probability distribution

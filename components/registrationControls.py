@@ -1,5 +1,17 @@
 import numpy as np
-from dash import html, Input, Output, State, callback, dcc
+from dash import (
+    html,
+    Input,
+    Output,
+    State,
+    callback,
+    dcc,
+    clientside_callback,
+    ctx,
+    no_update,
+    ALL,
+)
+
 import dash_bootstrap_components as dbc
 from settings import gc, memory, DSA_BASE_URL, token_info
 import dash_paperdragon
@@ -23,6 +35,19 @@ from utils.registration_utils import (
     create_thumbnail_card,
 )
 import time
+from settings import background_callback_manager
+
+### TO DEPRICATE OR MOVE TO SEPARATE COMPONENT
+## This loads /browses data from the DSA
+
+
+sampleCaseFolder = "641bfd45867536bb7a236ae1"
+
+## Good exaples to start with..
+caseList = [
+    {"label": "E20-11", "value": "641bfd45867536bb7a236ae1"},
+    {"label": "E20-106", "value": "641bfdd9867536bb7a236c3d"},
+]
 
 
 osdConfig = config = {
@@ -177,6 +202,25 @@ merged_image_controls = dbc.Row(
             width="auto",
             style={"width": "150px"},
         ),
+        # Step size selector
+        dbc.Col(
+            [
+                html.Label("Step:", className="mb-1 small"),
+                dbc.Select(
+                    id="offset-step-size",
+                    options=[
+                        {"label": "±1", "value": 1},
+                        {"label": "±10", "value": 10},
+                        {"label": "±100", "value": 100},
+                        {"label": "±1000", "value": 1000},
+                    ],
+                    value=1,
+                    size="sm",
+                ),
+            ],
+            width="auto",
+            style={"width": "80px"},
+        ),
         dbc.Col(
             [
                 html.Label("X:", className="mb-1 small"),
@@ -184,8 +228,13 @@ merged_image_controls = dbc.Row(
                     id="moving-image-x-offset",
                     type="number",
                     value=0,
+                    step="any",
                     className="form-control form-control-sm",
                     style={"width": "80px"},
+                    # Add these properties to format the number
+                    debounce=True,  # Only update on Enter or loss of focus
+                    inputMode="numeric",
+                    pattern="[0-9]*",  # Only allow numbers
                 ),
             ],
             width="auto",
@@ -197,8 +246,13 @@ merged_image_controls = dbc.Row(
                     id="moving-image-y-offset",
                     type="number",
                     value=0,
+                    step="any",
                     className="form-control form-control-sm",
                     style={"width": "80px"},
+                    # Add these properties to format the number
+                    debounce=True,  # Only update on Enter or loss of focus
+                    inputMode="numeric",
+                    pattern="[0-9]*",  # Only allow numbers
                 ),
             ],
             width="auto",
@@ -212,6 +266,10 @@ merged_image_controls = dbc.Row(
                     value=0,
                     className="form-control form-control-sm",
                     style={"width": "80px"},
+                    # Add these properties to format the number
+                    debounce=True,  # Only update on Enter or loss of focus
+                    inputMode="numeric",
+                    pattern="[0-9]*",  # Only allow numbers
                 ),
             ],
             width="auto",
@@ -226,14 +284,55 @@ registrationControls_layout = dbc.Container(
         dcc.Store(id="registration_caseId", data="641bfd45867536bb7a236ae1"),
         dcc.Store(id="registration_blockId", data="5"),
         dcc.Store(id="moving-image-metadata", data={}),
+        dcc.Store(id="registration_caseRootFolderId_store", data=sampleCaseFolder),
+        dcc.Store(id="registration_caseSlideSet_store", data=[]),
+        dcc.Store(id="selected-moving-slide", data=None),
         dbc.Row(
             [
                 dbc.Col(
                     [
-                        # html.H3("Registration Controls", className="mb-2"),
+                        # Static controls section
                         dbc.Row(
                             [
-                                # Feature Detection Method
+                                dbc.Col(
+                                    [
+                                        html.Label(
+                                            "Select Case:", className="mb-1 small"
+                                        ),
+                                        dbc.Select(
+                                            id="registration_caseSelect",
+                                            options=caseList,
+                                            value=caseList[0]["value"],
+                                            size="sm",
+                                        ),
+                                    ],
+                                    width="auto",
+                                ),
+                                dbc.Col(
+                                    [
+                                        html.Label("Block ID:", className="mb-1 small"),
+                                        dbc.Select(
+                                            id="registration_blockID_filter_select",
+                                            options=[{}],
+                                            # options=[
+                                            #     {"label": "All Blocks", "value": "all"}
+                                            # ],
+                                            # value="all",
+                                            size="sm",
+                                        ),
+                                    ],
+                                    width="auto",
+                                ),
+                                dbc.Col(
+                                    dbc.Checkbox(
+                                        id="registration_show_annotated_only",
+                                        label="Only annotated",
+                                        value=False,
+                                        className="ml-3",
+                                    ),
+                                    width="auto",
+                                ),
+                                # Feature Detection Method - made narrower
                                 dbc.Col(
                                     [
                                         html.Label("Method:", className="mb-1 small"),
@@ -246,7 +345,6 @@ registrationControls_layout = dbc.Container(
                                                     "value": "sift",
                                                 },
                                                 {"label": "AKAZE", "value": "akaze"},
-                                                {"label": "BRISK", "value": "brisk"},
                                                 {
                                                     "label": "Canny Edge",
                                                     "value": "canny",
@@ -268,9 +366,10 @@ registrationControls_layout = dbc.Container(
                                             size="sm",
                                         ),
                                     ],
-                                    width=2,
+                                    width="auto",
+                                    style={"width": "160px"},  # Specify exact width
                                 ),
-                                # Number of Points
+                                # Number of Points - made narrower
                                 dbc.Col(
                                     [
                                         html.Label("Points:", className="mb-1 small"),
@@ -286,7 +385,8 @@ registrationControls_layout = dbc.Container(
                                             size="sm",
                                         ),
                                     ],
-                                    width=1,
+                                    width="auto",
+                                    style={"width": "90px"},  # Specify exact width
                                 ),
                                 # Thumbnail Width
                                 dbc.Col(
@@ -304,9 +404,10 @@ registrationControls_layout = dbc.Container(
                                             size="sm",
                                         ),
                                     ],
-                                    width=1,
+                                    width="auto",
+                                    style={"width": "110px"},  # Specify exact width
                                 ),
-                                # Registration Parameters
+                                # Registration Parameters - now on same row
                                 dbc.Col(
                                     [
                                         html.Label(
@@ -337,30 +438,47 @@ registrationControls_layout = dbc.Container(
                                             className="small",
                                         ),
                                     ],
-                                    width=6,
+                                    width="auto",
                                 ),
                             ],
                             className="mb-2 g-2 align-items-end",
                         ),
-                        dcc.Loading(
-                            id="registration-loading",
-                            type="circle",
-                            children=[
-                                dbc.Row(
-                                    [
-                                        dbc.Col(
-                                            [
-                                                html.Div(
-                                                    id="registration-thumbnail-grid",
-                                                    className="d-flex flex-wrap gap-2 mb-3",
-                                                )
-                                            ]
-                                        ),
-                                        dbc.Col([merged_image_controls], width=4),
-                                    ]
+                        # Thumbnails and merged controls in same row
+                        dbc.Row(
+                            [
+                                # Thumbnail grid with horizontal scroll
+                                dbc.Col(
+                                    dcc.Loading(
+                                        id="registration-loading",
+                                        type="circle",
+                                        children=[
+                                            html.Div(
+                                                id="registration-thumbnail-grid",
+                                                className="d-flex flex-nowrap gap-2",
+                                                style={
+                                                    "overflowX": "auto",
+                                                    "whiteSpace": "nowrap",
+                                                    "paddingBottom": "10px",
+                                                    "maxHeight": "200px",
+                                                },
+                                            ),
+                                        ],
+                                    ),
+                                    width=7,
+                                    style={
+                                        "minWidth": 0,
+                                    },
+                                ),
+                                # Merged image controls
+                                dbc.Col(
+                                    merged_image_controls,
+                                    width=5,
+                                    className="align-self-center",
                                 ),
                             ],
+                            className="mb-3",
                         ),
+                        # Viewers section
                         dcc.Loading(
                             id="viewers-loading",
                             type="circle",
@@ -407,7 +525,7 @@ registrationControls_layout = dbc.Container(
                                             ],
                                             width=4,
                                         ),
-                                        # Merged Image Viewer
+                                        # Merged viewer column
                                         dbc.Col(
                                             [
                                                 html.Div(
@@ -437,7 +555,6 @@ registrationControls_layout = dbc.Container(
                 )
             ]
         ),
-        # thumbnail_debug_modal,
     ],
     fluid=True,
     className="px-2",
@@ -447,9 +564,14 @@ registrationControls_layout = dbc.Container(
 # Callback to populate thumbnails using the shared caseSlideSet_store
 @callback(
     Output("registration-thumbnail-grid", "children"),
-    [Input("caseSlideSet_store", "data"), Input("registration_blockId", "data")],
+    [
+        Input("registration_caseSlideSet_store", "data"),
+        Input("registration_blockID_filter_select", "value"),
+        Input("selected-moving-slide", "data"),
+    ],
 )
-def update_registration_thumbnails(slideList, selected_block):
+def update_registration_thumbnails(slideList, selected_block, selected_slide_id):
+    """Single callback to handle all thumbnail grid updates"""
     if not slideList or not selected_block:
         return []
 
@@ -461,7 +583,10 @@ def update_registration_thumbnails(slideList, selected_block):
     ]
 
     # Create thumbnail cards for each slide
-    thumbnail_cards = [create_thumbnail_card(slide) for slide in filtered_slides]
+    thumbnail_cards = [
+        create_thumbnail_card(slide, selected=(slide.get("_id") == selected_slide_id))
+        for slide in filtered_slides
+    ]
 
     return thumbnail_cards
 
@@ -481,13 +606,15 @@ def update_registration_thumbnails(slideList, selected_block):
         Output("moving-image-metadata", "data"),
     ],
     [
-        Input("caseSlideSet_store", "data"),
-        Input("registration_blockId", "data"),
+        Input("registration_caseSlideSet_store", "data"),
+        Input("registration_blockID_filter_select", "value"),
         Input("feature-detection-method", "value"),
         Input("num-points-selector", "value"),
         Input("registration-constraints", "value"),
         Input("thumbnail-width-selector", "value"),
     ],
+    background=True,
+    background_callback_manager=background_callback_manager,
 )
 def setup_registration_images(
     slideList,
@@ -497,6 +624,11 @@ def setup_registration_images(
     constraints,
     thumbnail_width,
 ):
+    print(f"selected_block: {selected_block}")
+
+    if selected_block == "all":
+        return [], {}, [], {}, 0, 0, 0, [], [], {}
+
     # Get slides
     he_slide, moving_slide = get_slides_for_registration(slideList, selected_block)
     if not he_slide or not moving_slide:
@@ -658,18 +790,21 @@ def setup_registration_images(
                     [
                         html.Div(
                             f"Size: {he_tiles_info.get('sizeX', 'N/A')}×{he_tiles_info.get('sizeY', 'N/A')}  |  "
+                            f"Resolution: {he_tiles_info.get('mm_x', 'N/A')}  |  "
                             f"Magnification: {he_tiles_info.get('magnification', 'N/A')}"
                         )
                     ],
                     [
                         html.Div(
                             f"Size: {moving_tiles_info.get('sizeX', 'N/A')}×{moving_tiles_info.get('sizeY', 'N/A')}  |  "
+                            f"Resolution: {he_tiles_info.get('mm_x', 'N/A')}  |  "
                             f"Magnification: {moving_tiles_info.get('magnification', 'N/A')}"
                         )
                     ],
                     {
                         "sizeX": moving_tiles_info.get("sizeX", 1.0),
                         "sizeY": moving_tiles_info.get("sizeY", 1.0),
+                        f"Resolution: {he_tiles_info.get('mm_x', 'N/A')}  |  "
                         "magnification": moving_tiles_info.get("magnification", "N/A"),
                     },
                 )
@@ -728,6 +863,61 @@ def setup_registration_images(
             [],
             {},
         )
+
+
+# Add callback to populate the filter options
+@callback(
+    Output("registration_blockID_filter_select", "options"),
+    Output("registration_blockID_filter_select", "value"),
+    [
+        Input("registration_caseSlideSet_store", "data"),
+        Input("registration_show_annotated_only", "value"),
+    ],
+)
+def update_blockID_filter_options(slideList, show_annotated_only):
+    if not slideList:
+        return [{"label": "All Blocks", "value": "all"}]
+
+    # First filter slides by annotation count if needed
+    if show_annotated_only:
+        slideList = [
+            slide for slide in slideList if slide.get("annotationCount", 0) > 0
+        ]
+
+    # Extract unique blockIDs from the filtered data
+    unique_blockIDs = list(
+        set(
+            slide.get("meta", {}).get("npSchema", {}).get("blockID", "")
+            for slide in slideList
+        )
+    )
+    unique_blockIDs = [bid for bid in unique_blockIDs if bid]  # Remove empty values
+
+    # Create options list with "All Blocks" as first option
+    # options = [{"label": "All Blocks", "value": "all"}]
+    options = [{"label": bid, "value": bid} for bid in sorted(unique_blockIDs)]
+
+    return options, options[0]["value"]
+
+
+### Populate caseSlideSet based on the currently slided caseID
+@callback(
+    Output("registration_caseSlideSet_store", "data"),
+    [Input("registration_caseSelect", "value")],
+)
+@memory.cache  ## Remove this when you start doing any updates..
+def populate_caseSlideSet(caseFolderId):
+    ## May want to add schema validation here in the future
+    slideList = list(gc.listItem(caseFolderId))
+
+    annotationCountStr = (
+        f"annotation/counts?items={','.join([x['_id'] for x in slideList])}"
+    )
+    annotationCounts = gc.get(annotationCountStr)
+    for sl in slideList:
+        print(sl)
+        sl["annotationCount"] = annotationCounts[sl["_id"]]
+    return slideList
 
 
 # # Add new callback for thumbnail display
@@ -807,29 +997,28 @@ def setup_registration_images(
 
 
 # Optional: Add a text indicator for more explicit status
-@callback(
-    Output("registration-loading", "children"),
-    [Input("feature-detection-method", "value"), Input("num-points-selector", "value")],
-    prevent_initial_call=True,
-)
-def update_loading_status(method, num_points):
-    """Show loading status while registration is running"""
-    # This will trigger the loading spinner
-    time.sleep(0.1)  # Small delay to ensure spinner shows
-    return [
-        dbc.Row(
-            [
-                dbc.Col(
-                    [
-                        html.Div(
-                            id="registration-thumbnail-grid",
-                            className="d-flex flex-wrap gap-2 mb-3",
-                        )
-                    ]
-                )
-            ]
-        )
-    ]
+# @callback(
+#     Output("registration-loading", "children"),
+#     [Input("feature-detection-method", "value"), Input("num-points-selector", "value")],
+#     prevent_initial_call=True,
+# )
+# def update_loading_status(method, num_points):
+#     """Show loading status while registration is running"""
+#     time.sleep(0.1)
+#     return [
+#         dbc.Row(
+#             [
+#                 dbc.Col(
+#                     [
+#                         html.Div(
+#                             id="registration-thumbnail-grid",
+#                             className="d-flex flex-wrap gap-2 mb-3",
+#                         )
+#                     ]
+#                 )
+#             ]
+#         )
+#     ]
 
 
 @callback(
@@ -943,6 +1132,23 @@ def update_transform(opacity, x_offset, y_offset, rotation, metadata):
         ]
 
 
+clientside_callback(
+    """
+    function(stepSize) {
+        // Update the step attribute of x and y offset inputs
+        const xOffset = document.getElementById('moving-image-x-offset');
+        const yOffset = document.getElementById('moving-image-y-offset');
+        if (xOffset && yOffset) {
+            xOffset.step = stepSize;
+            yOffset.step = stepSize;
+        }
+        return [dash.no_update, dash.no_update];
+    }
+    """,
+    [Output("moving-image-x-offset", "step"), Output("moving-image-y-offset", "step")],
+    [Input("offset-step-size", "value")],
+)
+
 # def create_tile_source_props(r, index=None):
 #     """Create tile source properties for viewer updates"""
 #     try:
@@ -969,3 +1175,103 @@ def update_transform(opacity, x_offset, y_offset, rotation, metadata):
 #             props["index"] = index
 
 #         return props
+
+# clientside_callback(
+#     """
+#     function(x, y, rot) {
+#         // Round numbers to integers
+#         return [
+#             Math.round(x),
+#             Math.round(y),
+#             Math.round(rot)
+#         ];
+#     }
+#     """,
+#     [
+#         Output("moving-image-x-offset", "value"),
+#         Output("moving-image-y-offset", "value"),
+#         Output("moving-image-rotation", "value"),
+#     ],
+#     [
+#         Input("moving-image-x-offset", "value"),
+#         Input("moving-image-y-offset", "value"),
+#         Input("moving-image-rotation", "value"),
+#     ],
+# )
+
+
+def create_thumbnail_card(slide, selected=False):
+    """Create a thumbnail card with colored headers for fixed/moving images"""
+    stain_id = slide.get("meta", {}).get("npSchema", {}).get("stainID", "Unknown")
+    slide_id = slide.get("_id", "")
+
+    # Determine header color based on stain type and selection
+    header_style = {
+        "padding": "0.25rem 0.5rem",
+        "marginBottom": "4px",
+    }
+
+    if stain_id.upper() == "HE":
+        header_style["backgroundColor"] = "#e3f2fd"  # Light blue for fixed/HE
+        header_style["cursor"] = "pointer"
+    elif selected:
+        header_style["backgroundColor"] = "#c8e6c9"  # Light green for selected
+        header_style["cursor"] = "pointer"
+    elif stain_id.upper() not in ["HE", "UNKNOWN"]:
+        header_style["backgroundColor"] = "#fff3e0"  # Light orange for moving/IHC
+        header_style["cursor"] = "pointer"
+
+    return dbc.Card(
+        [
+            html.Div(
+                dbc.CardHeader(
+                    [
+                        html.P(
+                            f"Stain: {stain_id}",
+                            className="small mb-0",
+                        )
+                    ],
+                    className="p-1",
+                    style=header_style,
+                ),
+                id={"type": "thumbnail-card", "index": slide_id, "stain": stain_id},
+                n_clicks=0,
+            ),
+            dbc.CardImg(
+                src=f"{DSA_BASE_URL}/item/{slide_id}/tiles/thumbnail?token={token_info['_id']}",
+                top=True,
+                style={
+                    "objectFit": "contain",
+                    "marginTop": "4px",
+                },
+            ),
+        ],
+        className="border-0",
+        style={"backgroundColor": "transparent"},
+    )
+
+
+@callback(
+    [
+        Output("selected-moving-slide", "data"),
+        Output("registration-loading", "children", allow_duplicate=True),
+    ],
+    Input({"type": "thumbnail-card", "index": ALL, "stain": ALL}, "n_clicks"),
+    State({"type": "thumbnail-card", "index": ALL, "stain": ALL}, "id"),
+    prevent_initial_call=True,
+)
+def handle_thumbnail_click(n_clicks, ids):
+    """Handle clicks on thumbnail card headers"""
+    if not ctx.triggered_id:
+        return no_update, no_update
+
+    # Get the clicked card's ID and stain
+    clicked_id = ctx.triggered_id["index"]
+    clicked_stain = ctx.triggered_id["stain"]
+
+    # Only update selection if it's not an HE slide
+    if clicked_stain.upper() != "HE":
+        print(f"Selected moving slide: {clicked_id}")
+        return clicked_id, no_update
+
+    return no_update, no_update
