@@ -61,9 +61,9 @@ def normalize_image_sizes(fixed_img, moving_img):
     fixed_h, fixed_w = fixed_img.shape[:2]
     moving_h, moving_w = moving_img.shape[:2]
 
-    print(
-        f"Original dimensions - fixed: {fixed_h}x{fixed_w}, moving: {moving_h}x{moving_w}"
-    )
+    # print(
+    #     f"Original dimensions - fixed: {fixed_h}x{fixed_w}, moving: {moving_h}x{moving_w}"
+    # )
 
     target_w = min(fixed_w, moving_w)
     target_h = min(fixed_h, moving_h)
@@ -71,8 +71,8 @@ def normalize_image_sizes(fixed_img, moving_img):
     fixed_scale = {"x": fixed_w / target_w, "y": fixed_h / target_h}
     moving_scale = {"x": moving_w / target_w, "y": moving_h / target_h}
 
-    print(f"Target dimensions: {target_h}x{target_w}")
-    print(f"Scale factors - fixed: {fixed_scale}, moving: {moving_scale}")
+    # print(f"Target dimensions: {target_h}x{target_w}")
+    # print(f"Scale factors - fixed: {fixed_scale}, moving: {moving_scale}")
 
     fixed_resized = cv2.resize(fixed_img, (target_w, target_h))
     moving_resized = cv2.resize(moving_img, (target_w, target_h))
@@ -375,31 +375,31 @@ def filter_points_with_constraints(
         return fixed_points, moving_points
 
 
-def create_thumbnail_card(item):
-    return dbc.Card(
-        [
-            dbc.CardHeader(
-                item.get("meta", {})
-                .get("npSchema", {})
-                .get("stainID", "Unknown Stain"),
-                className="text-center",
-                style={
-                    "padding": "0.1rem",  # Minimal padding
-                    "font-size": "0.8rem",  # Small font
-                    "line-height": "1",  # Reduce line height
-                    "font-weight": "500",  # Medium weight
-                    "margin": "0",  # Remove margin
-                },
-            ),
-            dbc.CardImg(
-                src=f"{DSA_BASE_URL}/item/{item['_id']}/tiles/thumbnail?token={token_info['_id']}",
-                top=True,
-                style={"height": "150px", "objectFit": "contain"},
-            ),
-        ],
-        className="mb-3",
-        style={"width": "200px"},
-    )
+# def create_thumbnail_card(item):
+#     return dbc.Card(
+#         [
+#             dbc.CardHeader(
+#                 item.get("meta", {})
+#                 .get("npSchema", {})
+#                 .get("stainID", "Unknown Stain"),
+#                 className="text-center",
+#                 style={
+#                     "padding": "0.1rem",  # Minimal padding
+#                     "font-size": "0.8rem",  # Small font
+#                     "line-height": "1",  # Reduce line height
+#                     "font-weight": "500",  # Medium weight
+#                     "margin": "0",  # Remove margin
+#                 },
+#             ),
+#             dbc.CardImg(
+#                 src=f"{DSA_BASE_URL}/item/{item['_id']}/tiles/thumbnail?token={token_info['_id']}",
+#                 top=True,
+#                 style={"height": "150px", "objectFit": "contain"},
+#             ),
+#         ],
+#         className="mb-3",
+#         style={"width": "200px"},
+#     )
 
 
 #     )
@@ -454,6 +454,8 @@ def scale_points_to_full_size(points, thumbnail_size, full_size):
 
     scale_x = full_size["width"] / thumbnail_size[1]  # width is dim 1 in thumbnail
     scale_y = full_size["height"] / thumbnail_size[0]  # height is dim 0 in thumbnail
+
+    # print(scale_x, scale_y, "scale_x, scale_y")
 
     return [(x * scale_x, y * scale_y) for x, y in points]
 
@@ -529,3 +531,60 @@ def create_registration_points(
 
         traceback.print_exc()
         return [], [], {}
+
+
+def calculate_optimal_transform(fixed_points, moving_points):
+    """Calculate optimal transform parameters from fixed to moving points"""
+    try:
+        # Convert points to numpy arrays
+        fixed = np.array(
+            [
+                [
+                    p.get("geometry", {}).get("coordinates", [0, 0])[0],
+                    p.get("geometry", {}).get("coordinates", [0, 0])[1],
+                ]
+                for p in fixed_points
+            ]
+        )
+        moving = np.array(
+            [
+                [
+                    p.get("geometry", {}).get("coordinates", [0, 0])[0],
+                    p.get("geometry", {}).get("coordinates", [0, 0])[1],
+                ]
+                for p in moving_points
+            ]
+        )
+
+        if len(fixed) < 2 or len(moving) < 2:
+            return None, None, None
+
+        # Calculate centroids
+        fixed_centroid = np.mean(fixed, axis=0)
+        moving_centroid = np.mean(moving, axis=0)
+
+        # Center the points
+        fixed_centered = fixed - fixed_centroid
+        moving_centered = moving - moving_centroid
+
+        # Calculate rotation matrix
+        H = fixed_centered.T @ moving_centered
+        U, _, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+
+        # Calculate rotation angle
+        rotation_angle = np.arctan2(R[1, 0], R[0, 0])
+        rotation_degrees = np.degrees(rotation_angle)
+
+        # Calculate translation
+        translation = moving_centroid - fixed_centroid @ R
+
+        # print(
+        #     f"Calculated transform: x={translation[0]:.2f}, y={translation[1]:.2f}, rotation={rotation_degrees:.2f}°"
+        # )
+
+        return translation[0], translation[1], rotation_degrees
+
+    except Exception as e:
+        print(f"Error calculating transform: {str(e)}")
+        return None, None, None

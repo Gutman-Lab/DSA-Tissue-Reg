@@ -77,6 +77,15 @@ filter_controls = dbc.Row(
             ),
             width="auto",
         ),
+        dbc.Col(
+            dbc.Select(
+                id="regImage_size_select",
+                options=[256, 384, 512, 1024],
+                value=256,
+                style={"width": "200px", "marginLeft": "15px"},
+            ),
+            width="auto",
+        ),
     ],
     className="mb-3 align-items-center",
 )

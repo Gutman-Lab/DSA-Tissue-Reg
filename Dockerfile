@@ -29,7 +29,7 @@ RUN pip install dash_paperdragon==0.1.11
 # For environments with multiple CPU cores, increase the number of workers
 # to be equal to the cores available in Cloud Run.
 # CMD exec gunicorn --bind :6667 --log-level info --workers 1 --worker-class uvicorn.workers.UvicornWorker --threads 3 --timeout 0 --reload app:server
-RUN pip install dash[diskcache]
+RUN pip install dash[diskcache] scipy
 
 EXPOSE 8050
 #CMD exec gunicorn --bind 0.0.0.0:6667 --log-level info --workers 1 --timeout 0 --reload app:server

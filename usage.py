@@ -45,7 +45,7 @@ app = Dash(
     external_scripts=[
         "https://unpkg.com/react@17/umd/react.production.min.js",
         "https://unpkg.com/react-dom@17/umd/react-dom.production.min.js",
-        "/assets/react-color-bundle.js",  # Load this first
+        # "/assets/react-color-bundle.js",  # Load this first
         "/assets/dashAgGridFunctions.js",  # Then load your grid functions
     ],
 )
@@ -723,14 +723,7 @@ def add_random_base64_tilesource():
 def update_tilesource_props(
     cellChanged, img_data, dataSetSelect, add_source_clicks, currentTileSources
 ):
-    print(cellChanged, "is the cellChanged")
-    print(img_data, "is the img_data")
-    print(dataSetSelect, "is the dataSetSelect")
-    print(add_source_clicks, "is the add_source_clicks")
-    print(currentTileSources, "is the currentTileSources")
-
     ctx = callback_context
-
     triggered_prop_id = ctx.triggered[0]["prop_id"].split(".")[0]
     print(f"Triggered by: {triggered_prop_id}")
 
@@ -739,13 +732,14 @@ def update_tilesource_props(
         print("Now setting image select...")
         imgSet = tileSourceDictTwo[dataSetSelect]
         imgSources = standardize_tilesource_properties(imgSet)
-
         normalized_tilesources = [
             normalize_tile_source(r) for r in imgSources if r is not None
         ]
 
-        print(imgSources, "is the imgSources")
-        return no_update, normalized_tilesources, no_update, imgSources
+        # Add clearItems action when switching images
+        clear_action = {"actions": [{"type": "clearItems"}]}
+
+        return no_update, normalized_tilesources, clear_action, imgSources
 
     if triggered_prop_id == "add_source_button" and add_source_clicks:
         print("Adding new tile source")
@@ -787,6 +781,7 @@ def update_tilesource_props(
     State("osdViewerComponent", "viewportBounds"),
     State("osdShapeData_store", "data"),
     State("clearItems-toggle", "value"),
+    State("imgSrc_table", "rowData"),
     Input("annotationTable", "selectedRows"),
     prevent_initial_call=True,
 )
@@ -796,150 +791,38 @@ def handleOutputFromPaper(
     viewPortBounds,
     currentShapeData,
     clearItems,
+    imgSrc_data,
     selectedAnnotation,
 ):
-    ### Need to determine which input triggered the callback
-
     ctx = callback_context
+    triggered_prop_id = ctx.triggered[0]["prop_id"].split(".")[0]
 
-    if not ctx.triggered:
-        return no_update, no_update, {}
-
-    try:
-        triggered_prop_id = ctx.triggered[0]["prop_id"].split(".")[0]
-    except:
-        print("Something odd about the context... need better error handling..")
-        print(ctx.triggered)
-        return no_update, no_update, {}
-
-    ## if the osdViewerComponent is the trigger then we need to process the outputFromPaper
-
-    ## Process the annotation table selection and pull the annotation and then push
-    ## it to the paperdragon, also need to convert the DSA format
-    if triggered_prop_id == "annotationTable":
-        shapesToAdd = annotationToGeoJson(selectedAnnotation[0])
+    if triggered_prop_id == "make_random_button":
+        # Get number of layers from imgSrc_table
+        num_layers = len(imgSrc_data) if imgSrc_data else 1
+        try:
+            # Try with explicit keyword arguments
+            shapesToAdd = generate_random_boxes(
+                numBoxes=3, viewPortBounds=viewPortBounds, num_layers=num_layers
+            )
+        except TypeError as e:
+            print(f"Error in generate_random_boxes: {e}")
+            # Fallback to just 2 arguments if the 3-arg version isn't working
+            shapesToAdd = generate_random_boxes(3, viewPortBounds)
 
         inputToPaper = {"actions": []}
 
-        # If I don't clear items, I also need to update the shapesToAdd
         if clearItems:
             inputToPaper["actions"].append({"type": "clearItems"})
-        inputToPaper["actions"].append({"type": "drawItems", "itemList": shapesToAdd})
-        # print(shapesToAdd)
-        return inputToPaper, shapesToAdd, {}
-
-    if triggered_prop_id == "osdViewerComponent":
-        osdEventType = paperOutput.get("data", {}).get("callback", None)
-        if not osdEventType:
-            osdEventType = paperOutput.get("callback", None)
-
-        if osdEventType in ["mouseLeave", "mouseEnter"]:
-            return no_update, no_update, {}
-        elif osdEventType == "createItem":
-            # print(paperOutput["data"])
-
-            ## NEED TO MAKE SURE THE OBJECT ID IS SET
-            si = get_box_instructions(
-                paperOutput["data"]["point"]["x"],
-                paperOutput["data"]["point"]["y"],
-                paperOutput["data"]["size"]["width"],
-                paperOutput["data"]["size"]["height"],
-                colors[0],
-                {"class": classes[0], "objId": getId()},
-            )
-            currentShapeData.append(si)
-
-            return createItem(paperOutput["data"]), currentShapeData, {}
-        elif osdEventType == "propertyChanged":
-            ### Handle property change.. probably class change but could be color or other thing in the future
-            # print(paperOutput["data"])
-            # print(changedProp, "is the changedProp")
-            ## TO DO--- THIS IS NOT CONSISTENTLY FIRING ON EVERY CHANGE..
-
-            changedProp = paperOutput.get("data", {}).get("property", "")
-            if changedProp == "class":
-                newClass = paperOutput.get("data", {}).get("item", {}).get("class", "")
-                objectId = (
-                    paperOutput.get("data", {}).get("item", {}).get("objectId", "")
-                )
-                for r in currentShapeData:
-                    if r["userdata"]["objectId"] == objectId:
-                        r["userdata"]["class"] = newClass
-                        print("Changed object class to", newClass)
-                        break
-                return no_update, currentShapeData, {}
-        elif osdEventType == "itemDeleted":
-            # print(paperOutput["data"]["item"])
-            itemId = paperOutput["data"]["item"][1]["data"]["userdata"]["objectId"]
-            print("Item Deleted", itemId)
-            currentShapeData = [
-                x for x in currentShapeData if x["userdata"]["objectId"] != itemId
-            ]
-            return no_update, currentShapeData, {}
-            ### TO DO-- CLARIFY FROM TOM WHAT THE DELETEITEM callback should return in the react component
-
-            ## Note the class is changing, but that also changes the color... will need to think about how to keep all this stuff in sync
-        elif osdEventType == "itemEdited":
-            print("ITEM WAS EDITED")
-            print(paperOutput)
-            ### NEED TO UPDATE THE TABLE WITH THE OBJECT THAT WAS UPDATED...
-            ## WILL ADD A ROTATION PREOPRETY FOR NOW..
-            try:
-                print(currentShapeData[0])
-            except:
-                print(
-                    "Trying to print currentShapeData[0], but it's throwing an error..."
-                )
-                print(currentShapeData, "is what I was trying to iterate on...")
-
-            editedObjId = paperOutput["data"]["userdata"].get("objId", None)
-            ## NEED TO DEAL WITH CASE IF objID is not set on an edited item?  This maybe shouldn't happen though.. TBD...
-            editedObjIdx = find_index_by_objId(currentShapeData, editedObjId)
-            if editedObjIdx == -1:
-                print("Could not find object with objId", editedObjId)
-                return no_update, currentShapeData, {}
-            else:
-                print("Found object at index", editedObjIdx)
-
-                currentShapeData[editedObjIdx]["rotation"] = "IWASROTATED"
-
-            return no_update, currentShapeData, {}
-
+            items_to_draw = shapesToAdd
         else:
-            print("Unhandled osdEventType", osdEventType)
-            print(paperOutput, "is the paperOutput")
-
-            return no_update, no_update, {}
-    # {'callback': 'propertyChanged', 'data': {'item': {'class': 'e', 'objectId': 1}, 'property': 'class'}} is the paperOutput
-
-    elif triggered_prop_id == "make_random_button":
-        ### Clear Items.. or not..
-
-        shapesToAdd = generate_random_boxes(3, viewPortBounds)
-        inputToPaper = {"actions": []}
-        # print(shapesToAdd)
-        # If I don't clear items, I also need to update the shapesToAdd
-        if clearItems:
-            inputToPaper["actions"].append({"type": "clearItems"})
-            inputToPaper["actions"].append(
-                {"type": "drawItems", "itemList": shapesToAdd}
-            )
-
-            return inputToPaper, shapesToAdd, {}
-
-        else:
-            ## Add new items to paper, and also update the local array store
             print("Adding new items to paper ... keeping the old")
-            inputToPaper["actions"].append(
-                {"type": "drawItems", "itemList": shapesToAdd}
-            )
-            currentShapeData = currentShapeData + shapesToAdd
-            return inputToPaper, currentShapeData, {}
+            items_to_draw = currentShapeData + shapesToAdd
 
-    else:
-        print(triggered_prop_id, "was the triggered prop")
+        inputToPaper["actions"].append({"type": "drawItems", "itemList": items_to_draw})
+        return inputToPaper, items_to_draw, {}
 
-    return no_update, no_update, {}
+    # ... rest of the callback ...
 
 
 @callback(
@@ -1140,3 +1023,60 @@ if __name__ == "__main__":
 #                 # "compositeOperation": "screen",
 # Valid values are 'source-over', 'source-atop', 'source-in', 'source-out', 'destination-over', 'destination-atop', 'destination-in', 'destination-out', 'lighter', 'difference', 'copy', 'xor', etc. For complete list of modes, please
 ## ADD FLIPPED OPTION!!!
+
+
+def generate_random_boxes(numBoxes, viewPortBounds, num_layers=1):
+    """Generate random boxes within viewport bounds, optionally assigning to random layers
+
+    Args:
+        numBoxes (int): Number of boxes to generate
+        viewPortBounds (dict): Dictionary containing x, y, width, height of viewport
+        num_layers (int, optional): Number of available layers. Defaults to 1.
+    """
+    boxes = []
+    for i in range(numBoxes):
+        # Generate random position within bounds
+        x = random.uniform(
+            viewPortBounds["x"], viewPortBounds["x"] + viewPortBounds["width"]
+        )
+        y = random.uniform(
+            viewPortBounds["y"], viewPortBounds["y"] + viewPortBounds["height"]
+        )
+
+        # Random size between 1% and 10% of viewport
+        width = random.uniform(0.01, 0.1) * viewPortBounds["width"]
+        height = random.uniform(0.01, 0.1) * viewPortBounds["height"]
+
+        # If multiple layers exist, randomly assign to a layer
+        layerIdx = random.randint(0, num_layers - 1) if num_layers > 1 else None
+
+        # Create box with random color and class
+        box = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [x, y],
+                        [x + width, y],
+                        [x + width, y + height],
+                        [x, y + height],
+                        [x, y],
+                    ]
+                ],
+            },
+            "properties": {
+                "fillColor": random.choice(colors),
+                "strokeColor": random.choice(colors),
+                "fillOpacity": 0.2,
+                "userdata": {"class": random.choice(classes), "objId": getId()},
+            },
+        }
+
+        # Add layerIdx to properties if we have multiple layers
+        if layerIdx is not None:
+            box["properties"]["layerIdx"] = layerIdx
+
+        boxes.append(box)
+
+    return boxes

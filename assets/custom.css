@@ -56,3 +56,24 @@
     flex: 1;
     margin: 0 4px;
 }
+
+.custom-tab {
+    padding: 6px 16px;
+    border-radius: 4px;
+    margin-right: 4px;
+    border: 1px solid #dee2e6;
+    background-color: #f8f9fa;
+}
+
+.custom-tab--selected {
+    padding: 6px 16px;
+    border-radius: 4px;
+    margin-right: 4px;
+    border: 1px solid #007bff;
+    background-color: #007bff !important;
+    color: white;
+}
+
+.custom-tabs {
+    border-bottom: none !important;
+}
