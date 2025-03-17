@@ -41,6 +41,7 @@ from components.osdRegViewers import (
     merged_image_viewer,
     osdViewer_layout,
 )
+from transformers import AutoModel, AutoFeatureExtractor
 
 ## Good exaples to start with..
 caseList = [
@@ -75,8 +76,6 @@ parameter_controls = dbc.Row(
                     type="number",
                     value=1,
                     min=0.001,
-                    # step=0.01,
-                    # min=0,
                 ),
             ],
             width=4,
@@ -972,3 +971,83 @@ def update_manual_offset_data(rotation, scale, offset_x, offset_y):
     )
 
     return parameters
+
+
+### UNI model for image processing
+def process_image_with_uni(image_path):
+    """
+    Load an image from path and process it through the UNI model
+
+    Args:
+        image_path (str): Path to the image file
+
+    Returns:
+        torch.Tensor: Feature embedding from the model
+    """
+    from PIL import Image
+    import torch
+    import torchvision.transforms as transforms
+    from transformers import AutoModel, AutoFeatureExtractor
+
+    # Load the UNI model if not already loaded
+    try:
+        # Check if model is already defined in global scope
+        global model, feature_extractor
+        if "model" not in globals():
+            checkpoint = "MahmoodLab/UNI"
+            model = AutoModel.from_pretrained(checkpoint)
+            feature_extractor = AutoFeatureExtractor.from_pretrained(checkpoint)
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return None
+
+    try:
+        # Load and preprocess the image
+        sample_image = Image.open(image_path)
+        sample_image = sample_image.convert("RGB")
+
+        # Method 1: Using the feature extractor (preferred for transformer models)
+        try:
+            # Process the image using the model's feature extractor
+            inputs = feature_extractor(images=sample_image, return_tensors="pt")
+
+            # Process through model
+            with torch.inference_mode():
+                outputs = model(**inputs)
+                # Get the embeddings from the last hidden state
+                feature_emb = outputs.last_hidden_state
+
+            return feature_emb
+
+        except Exception as e:
+            print(f"Feature extractor method failed: {e}")
+
+            # Method 2: Manual preprocessing as fallback
+            transform = transforms.Compose(
+                [
+                    transforms.Resize((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
+                    ),
+                ]
+            )
+
+            # Apply transformations and add batch dimension
+            t_image = transform(sample_image).unsqueeze(dim=0)
+
+            # Process through model
+            with torch.inference_mode():
+                # Try with pixel_values key
+                outputs = model(pixel_values=t_image)
+                feature_emb = outputs.last_hidden_state
+
+            return feature_emb
+
+    except Exception as e:
+        print(f"Error processing image: {e}")
+        return None
+
+
+# Example usage:
+# feature_embedding = process_image_with_uni('/scr/dagutman/regions/0/0_12097.0_17356.0.png')

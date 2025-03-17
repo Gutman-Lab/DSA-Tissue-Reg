@@ -13,6 +13,8 @@ from components.registrationControls import (
 )
 
 
+from components.showStoredReg import showReg_layout
+
 from settings import background_callback_manager
 
 # Initialize the Dash app
@@ -26,27 +28,48 @@ app = dash.Dash(
 server = app.server
 
 
-registrationApp_layout = dbc.Container(
+# Define TabUno (your current layout)
+tab_uno_content = dbc.Container(
     [
-        caseSelect_controls,
-        thumbnail_grid,
-        osdViewer_layout,
         data_stores,
-        regPoint_layout,
-    ]
+        dbc.Row(
+            [
+                dbc.Col(caseSelect_controls, width=12),
+            ],
+            className="mb-4",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(thumbnail_grid, width=12),
+            ],
+            className="mb-4",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(regPoint_layout, width=12),
+            ],
+            className="mb-4",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(osdViewer_layout, width=12),
+            ],
+        ),
+    ],
+    fluid=True,
 )
 
-
-# Create tabs using dcc.Tabs with supported styling options
+# Define the tabs layout
 app.layout = dbc.Container(
     [
-        html.Div(id="caseSetViewer"),
-        html.H3(
-            "DSA Tissue Registration",
-            className="mb-2",
-            style={"align-self": "center", "text-align": "center"},
+        html.H1("Image Registration Tool", className="text-center mb-4"),
+        dcc.Tabs(
+            [
+                dcc.Tab(showReg_layout, label="Stored Registrations"),
+                dcc.Tab(tab_uno_content, label="Registration"),
+            ],
+            id="tabs-content",
         ),
-        registrationApp_layout,
     ],
     fluid=True,
 )
