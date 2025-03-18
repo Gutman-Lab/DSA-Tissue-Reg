@@ -4,7 +4,14 @@ from dash import html, dcc, callback, Input, Output
 import dash_bootstrap_components as dbc
 from settings import gc, memory, DSA_BASE_URL, token_info
 import dash_ag_grid
-from utils.carlosReg_utils import dice_coefficient
+from components.carlos_reg_utils import (
+    dice_coefficient,
+    apply_affine_transform,
+    register_fixed_moving,
+)
+import cv2
+import base64
+import numpy as np
 
 ## Good exaples to start with..
 caseList = [
@@ -49,7 +56,7 @@ def update_folder_contents(selected_case_id):
     try:
         # Get the contents of the selected folder from Girder
         folder_contents = list(gc.listItem(selected_case_id))
-        print(folder_contents, "folder contents")
+        # print(folder_contents, "folder contents")
         # Format the data for the grid
         row_data = []
         for item in folder_contents:
@@ -95,10 +102,48 @@ def update_folder_contents(selected_case_id):
 
 
 @callback(
+    Output("registered-image-preview", "src"),
+    Input("folder-contents-grid", "selectedRows"),
+)
+def update_registered_image(selected_rows):
+    if not selected_rows or len(selected_rows) == 0:
+        return ""
+
+    selected_item = selected_rows[0]
+    src_image_id = selected_item.get("srcImage", "")
+    target_id = selected_item.get("_id", "")
+    print(selected_item, "was selected")
+    # Get the registered image
+    reg_matrix, reg_image = register_fixed_moving(src_image_id, target_id)
+    resampled_image = apply_affine_transform(reg_image, reg_matrix)
+
+    # Convert numpy array to base64 image
+    # Convert to uint8 if not already
+    if resampled_image.dtype != np.uint8:
+        resampled_image = (resampled_image * 255).astype(np.uint8)
+
+    # Convert grayscale to RGB if needed
+    if len(resampled_image.shape) == 2:
+        resampled_image = cv2.cvtColor(resampled_image, cv2.COLOR_GRAY2RGB)
+
+    print("--- Now Resampling the image ---")
+
+    # Encode the image
+    success, buffer = cv2.imencode(".png", resampled_image)
+    if success:
+        registered_thumb = "data:image/png;base64," + base64.b64encode(buffer).decode(
+            "utf-8"
+        )
+        return registered_thumb
+    else:
+        print("Error encoding image")
+        registered_thumb = ""
+
+
+@callback(
     [
         Output("selected-source-thumbnail", "src"),
         Output("selected-target-thumbnail", "src"),
-        Output("registered-image-preview", "src"),
     ],
     Input("folder-contents-grid", "selectedRows"),
 )
@@ -107,25 +152,22 @@ def update_thumbnails(selected_rows):
         return "", "", ""
 
     selected_item = selected_rows[0]
-    reg_data = selected_item.get("srcImage", "")
+    src_image_id = selected_item.get("srcImage", "")
 
     # Only proceed if srcImage exists and is not empty
-    if not reg_data:
+    if not src_image_id:
         return "", "", ""
 
     target_id = selected_item.get("_id", "")
 
     source_thumb = (
-        f"{DSA_BASE_URL}/item/{reg_data}/tiles/thumbnail?token={token_info['_id']}"
+        f"{DSA_BASE_URL}/item/{src_image_id}/tiles/thumbnail?token={token_info['_id']}"
     )
     target_thumb = (
         f"{DSA_BASE_URL}/item/{target_id}/tiles/thumbnail?token={token_info['_id']}"
     )
-    # For now, we'll use the same target thumbnail for the registered image
-    # You might want to replace this with an actual registered image preview
-    registered_thumb = target_thumb
 
-    return source_thumb, target_thumb, registered_thumb
+    return source_thumb, target_thumb
 
 
 showReg_layout = dbc.Container(
@@ -250,22 +292,3 @@ def find_relative_rotation(padded_mask1, padded_mask2) -> tuple[int, float]:
             max_dice = dice
 
     return best_k * 90, max_dice  # Rotation angle and similarity score
-
-
-def carlos_affineReg(
-    src_image,
-    target_image,
-    preRotate,
-    size,
-    regImageSize,
-    rotation,
-    scale,
-    xOffset,
-    yOffset,
-):
-
-    # Get the image size from the target image
-    target_image_size = target_image.shape[0]
-
-    # Get the image size from the source image
-    src_image_size = src_image.shape[0]
