@@ -44,15 +44,17 @@ def generate_fiducial_points(image_bounds, num_points=8):
     return points[:num_points]
 
 
-@memory.cache
+# @memory.cache
 def get_thumbnail_image(item_id, width=1024):
     """Fetch thumbnail image from DSA and resize to specified width"""
     url = f"{DSA_BASE_URL}/item/{item_id}/tiles/thumbnail?token={token_info['_id']}&width={width}"
     response = requests.get(url)
     img = Image.open(BytesIO(response.content))
     img_np = np.array(img)
-    if len(img_np.shape) == 3:
-        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    # Convert to RGB if image is in RGBA format
+    if len(img_np.shape) == 3 and img_np.shape[2] == 4:
+        img = img.convert("RGB")
+        img_np = np.array(img)
     return img_np
 
 
@@ -93,7 +95,7 @@ def generate_distinct_colors(n):
     return colors
 
 
-@memory.cache
+# @memory.cache
 def calculate_mutual_information(hist):
     """Calculate mutual information from a joint histogram"""
     # Convert histogram to probability distribution

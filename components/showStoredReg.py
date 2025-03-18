@@ -1,6 +1,6 @@
 ## This will be a component that shows the stored registrations for a given case based on what's in the DSA case Folder
 
-from dash import html, dcc, callback, Input, Output
+from dash import html, dcc, callback, Input, Output, State
 import dash_bootstrap_components as dbc
 from settings import gc, memory, DSA_BASE_URL, token_info
 import dash_ag_grid
@@ -37,6 +37,12 @@ grid_columns = [
         "headerName": "Reg Image Size",
         "field": "regImageSize",
         "sortable": True,
+        "filter": True,
+        "filterParams": {
+            "filterOptions": ["equals"],
+            "defaultOption": "equals",
+            "defaultValue": "1024",
+        },
     },
     {"headerName": "Rotation", "field": "rotation", "sortable": True},
     {"headerName": "Scale", "field": "scale", "sortable": True},
@@ -56,12 +62,19 @@ def update_folder_contents(selected_case_id):
     try:
         # Get the contents of the selected folder from Girder
         folder_contents = list(gc.listItem(selected_case_id))
-        # print(folder_contents, "folder contents")
         # Format the data for the grid
         row_data = []
         for item in folder_contents:
             # Get registration metadata if it exists
             reg_data = item.get("meta", {}).get("npReg", {})
+            reg_image_size = reg_data.get("regImageSize", "")
+
+            # Convert reg_image_size to string for comparison
+            reg_image_size_str = str(reg_image_size)
+
+            # Only include rows where regImageSize is "1024" (as string or number)
+            if reg_image_size_str != "1024":
+                continue
 
             row_data.append(
                 {
@@ -70,7 +83,7 @@ def update_folder_contents(selected_case_id):
                     "preRotate": "None",  # Default value
                     "size": item.get("size", 0),
                     # Add registration metadata fields
-                    "regImageSize": reg_data.get("regImageSize", ""),
+                    "regImageSize": reg_image_size_str,
                     "rotation": (
                         round(reg_data.get("rotation", 0), 3)
                         if reg_data.get("rotation") is not None
@@ -112,21 +125,41 @@ def update_registered_image(selected_rows):
     selected_item = selected_rows[0]
     src_image_id = selected_item.get("srcImage", "")
     target_id = selected_item.get("_id", "")
-    print(selected_item, "was selected")
+    print("Selected source:", src_image_id)
+    print("Selected target:", target_id)
+
     # Get the registered image
     reg_matrix, reg_image = register_fixed_moving(src_image_id, target_id)
-    resampled_image = apply_affine_transform(reg_image, reg_matrix)
+    print("Registration matrix shape:", reg_matrix.shape)
+    print("Registration matrix:\n", reg_matrix)
+    print("Registered image shape:", reg_image.shape)
+    print("Registered image dtype:", reg_image.dtype)
+    print("Registered image min/max:", np.min(reg_image), np.max(reg_image))
 
-    # Convert numpy array to base64 image
+    resampled_image = apply_affine_transform(reg_image, reg_matrix)
+    print("Resampled image shape:", resampled_image.shape)
+    print("Resampled image dtype:", resampled_image.dtype)
+    print("Resampled image min/max:", np.min(resampled_image), np.max(resampled_image))
+
     # Convert to uint8 if not already
     if resampled_image.dtype != np.uint8:
+        print("Converting to uint8...")
         resampled_image = (resampled_image * 255).astype(np.uint8)
+        print(
+            "After uint8 conversion min/max:",
+            np.min(resampled_image),
+            np.max(resampled_image),
+        )
 
     # Convert grayscale to RGB if needed
     if len(resampled_image.shape) == 2:
+        print("Converting grayscale to RGB...")
         resampled_image = cv2.cvtColor(resampled_image, cv2.COLOR_GRAY2RGB)
+        print("After RGB conversion shape:", resampled_image.shape)
 
-    print("--- Now Resampling the image ---")
+    print("Final image shape before encoding:", resampled_image.shape)
+    print("Final image dtype:", resampled_image.dtype)
+    print("Final image min/max:", np.min(resampled_image), np.max(resampled_image))
 
     # Encode the image
     success, buffer = cv2.imencode(".png", resampled_image)
@@ -137,7 +170,7 @@ def update_registered_image(selected_rows):
         return registered_thumb
     else:
         print("Error encoding image")
-        registered_thumb = ""
+        return ""
 
 
 @callback(
@@ -168,6 +201,52 @@ def update_thumbnails(selected_rows):
     )
 
     return source_thumb, target_thumb
+
+
+@callback(
+    [
+        Output("blend-source-image", "src"),
+        Output("registered-image-preview", "style"),
+    ],
+    [
+        Input("folder-contents-grid", "selectedRows"),
+        Input("registration-blend-slider", "value"),
+    ],
+)
+def update_blended_view(selected_rows, blend_value):
+    if not selected_rows or len(selected_rows) == 0:
+        return "", {
+            "position": "absolute",
+            "top": 0,
+            "left": 0,
+            "width": "100%",
+            "height": "auto",
+            "border": "1px solid #ddd",
+            "borderRadius": "4px",
+            "padding": "5px",
+            "opacity": 1,
+        }
+
+    selected_item = selected_rows[0]
+    src_image_id = selected_item.get("srcImage", "")
+
+    # Get source image URL
+    source_url = (
+        f"{DSA_BASE_URL}/item/{src_image_id}/tiles/thumbnail?token={token_info['_id']}"
+    )
+
+    # Return source image URL and style for registered image
+    return source_url, {
+        "position": "absolute",
+        "top": 0,
+        "left": 0,
+        "width": "100%",
+        "height": "auto",
+        "border": "1px solid #ddd",
+        "borderRadius": "4px",
+        "padding": "5px",
+        "opacity": blend_value,
+    }
 
 
 showReg_layout = dbc.Container(
@@ -252,15 +331,68 @@ showReg_layout = dbc.Container(
                 dbc.Col(
                     [
                         html.H4("Registered Image", className="text-center mb-2"),
-                        html.Img(
-                            id="registered-image-preview",
-                            style={
-                                "maxWidth": "100%",
-                                "height": "auto",
-                                "border": "1px solid #ddd",
-                                "borderRadius": "4px",
-                                "padding": "5px",
-                            },
+                        html.Div(
+                            [
+                                # Container for stacked images
+                                html.Div(
+                                    [
+                                        # Source image (bottom layer)
+                                        html.Img(
+                                            id="blend-source-image",
+                                            style={
+                                                "position": "absolute",
+                                                "top": 0,
+                                                "left": 0,
+                                                "width": "100%",
+                                                "height": "auto",
+                                                "border": "1px solid #ddd",
+                                                "borderRadius": "4px",
+                                                "padding": "5px",
+                                            },
+                                        ),
+                                        # Registered image (top layer)
+                                        html.Img(
+                                            id="registered-image-preview",
+                                            style={
+                                                "position": "absolute",
+                                                "top": 0,
+                                                "left": 0,
+                                                "width": "100%",
+                                                "height": "auto",
+                                                "border": "1px solid #ddd",
+                                                "borderRadius": "4px",
+                                                "padding": "5px",
+                                            },
+                                        ),
+                                    ],
+                                    style={
+                                        "position": "relative",
+                                        "width": "100%",
+                                        "paddingBottom": "100%",  # Square aspect ratio
+                                    },
+                                ),
+                                html.Div(
+                                    [
+                                        html.Label(
+                                            "Blend with Source:", className="mt-2"
+                                        ),
+                                        dcc.Slider(
+                                            id="registration-blend-slider",
+                                            min=0,
+                                            max=1,
+                                            step=0.1,
+                                            value=1,
+                                            marks={
+                                                0: "Source",
+                                                0.5: "Blend",
+                                                1: "Registered",
+                                            },
+                                            className="mt-2",
+                                        ),
+                                    ],
+                                    style={"width": "100%", "padding": "10px"},
+                                ),
+                            ]
                         ),
                     ],
                     width=4,
