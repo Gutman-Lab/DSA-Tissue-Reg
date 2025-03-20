@@ -13,7 +13,7 @@ from PIL import Image
 import json
 import utils.registration_utils as reg_utils
 
-with open("config.yaml", "r") as file:
+with open("components/config.yaml", "r") as file:
     config = yaml.safe_load(file)
 
 bdsa_url = config["bdsa_url"]
@@ -111,65 +111,39 @@ def pad_to_size(mask, target_size) -> list:
 
 
 def apply_affine_transform(reg_image, transf_matrix):
-    print("\nApply Affine Transform Debug:")
-    print("Input image type:", type(reg_image))
-    print("Input image shape:", reg_image.shape)
-    print("Input image dtype:", reg_image.dtype)
-    print("Input image min/max:", np.min(reg_image), np.max(reg_image))
-    print("Transform matrix:\n", transf_matrix)
-
-    try:
-        # Ensure the image is in uint8 format
-        if reg_image.dtype != np.uint8:
-            reg_image = (reg_image * 255).astype(np.uint8)
-
-        # Get image dimensions
-        height, width = reg_image.shape[:2]
-
-        # Extract the 2x3 affine matrix from the 3x3 transformation matrix
-        affine_matrix = transf_matrix[:2, :]
-
-        # Split the channels
-        b, g, r = cv2.split(reg_image)
-
-        # Apply transformation to each channel separately
-        warped_r = cv2.warpAffine(
-            r,
-            affine_matrix,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        warped_g = cv2.warpAffine(
-            g,
-            affine_matrix,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        warped_b = cv2.warpAffine(
-            b,
-            affine_matrix,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-
-        # Merge the channels back together
-        warped_image = cv2.merge([warped_b, warped_g, warped_r])
-
-        print("Final output shape:", warped_image.shape)
-        print("Final output dtype:", warped_image.dtype)
-        print("Final output min/max:", np.min(warped_image), np.max(warped_image))
-
-        return warped_image
-
-    except Exception as e:
-        print(f"Error in affine transform: {str(e)}")
-        return reg_image  # Return original image if transform fails
+    print("NumPy array shape:", reg_image.shape)
+    
+    # Extract each channel as a 2D scalar image
+    channel1 = sitk.GetImageFromArray(reg_image[:, :, 0])
+    channel2 = sitk.GetImageFromArray(reg_image[:, :, 1])
+    channel3 = sitk.GetImageFromArray(reg_image[:, :, 2])
+    
+    # Compose the channels into a 2D vector image
+    reg_image_sitk = sitk.Compose([channel1, channel2, channel3])
+    print("Image Size:", reg_image_sitk.GetSize())  # Should be (1024, 927)
+    print("Number of Components:", reg_image_sitk.GetNumberOfComponentsPerPixel())  # Should be 3
+    
+    # Define the 2D affine transform
+    transform = sitk.AffineTransform(2)
+    transform.SetMatrix(transf_matrix[:2, :2].flatten().tolist())
+    transform.SetTranslation(transf_matrix[:2, 2].tolist())
+    inverse_transform = transform.GetInverse()
+    
+    # Resample the image with explicit parameters
+    resampled_image = sitk.Resample(
+        reg_image_sitk,
+        size=reg_image_sitk.GetSize(),
+        transform=inverse_transform,
+        interpolator=sitk.sitkLinear,
+        outputOrigin=reg_image_sitk.GetOrigin(),
+        outputSpacing=reg_image_sitk.GetSpacing(),
+        outputDirection=reg_image_sitk.GetDirection(),
+        defaultPixelValue=0.0,
+        outputPixelType=reg_image_sitk.GetPixelID()
+    )
+    # Save the transformed image
+    resampled_image = np.array(resampled_image).reshape((reg_image_sitk.GetSize()[0], reg_image_sitk.GetSize()[1], 3))
+    return resampled_image
 
 
 def dice_coefficient(mask1, mask2) -> np.array:
@@ -317,109 +291,168 @@ def register_fixed_moving(fixed_id, moving_id) -> np.array:
     #                REGISTRATION
     # ----------------------------------------------
 
+    # try:
+    # Convert to SimpleITK format - use grayscale for registration
+    # fixed_img = sitk.GetImageFromArray(fixed_gray)
+    # moving_img = sitk.GetImageFromArray(
+    #     cv2.cvtColor(moving_image_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    #     / 255.0
+    # )
+
+    # Load images as RGB
+    fixed_img = sitk.GetImageFromArray(fixed_img_sk, sitk.sitkVectorFloat32)
+    moving_img = sitk.GetImageFromArray(moving_image_rgb, sitk.sitkVectorFloat32)
+
+    # Convert to grayscale for initialization
+    fixed_image_gray = sitk.Cast(
+        sitk.VectorIndexSelectionCast(fixed_img, 0),
+        sitk.sitkFloat32
+        )
+    moving_image_gray = sitk.Cast(
+        sitk.VectorIndexSelectionCast(moving_img, 0),
+        sitk.sitkFloat32
+        )
+
+    # Define a similarity transform
+    transform = sitk.Similarity2DTransform()
+
+    # Initialize transform by aligning centers
+    initial_transform = sitk.CenteredTransformInitializer(
+        fixed_image_gray,
+        moving_image_gray,
+        transform,
+        sitk.CenteredTransformInitializerFilter.GEOMETRY,
+    )
+
+    # Set up registration
+    registration_method = sitk.ImageRegistrationMethod()
+
+    # Use mutual information metric
+    registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+
+    # Configure gradient descent optimizer
+    registration_method.SetOptimizerAsGradientDescent(
+        learningRate=0.1,
+        numberOfIterations=200,
+        convergenceMinimumValue=1e-6,
+        convergenceWindowSize=10
+    )
+
+    # Set interpolator
+    registration_method.SetInterpolator(sitk.sitkLinear)
+
+    # Apply initial transform
+    registration_method.SetInitialTransform(initial_transform, inPlace=True)
+
+    # Balance parameter updates
+    registration_method.SetOptimizerScalesFromPhysicalShift()
+
+    # Use multi-resolution for robustness
+    registration_method.SetShrinkFactorsPerLevel([4, 2, 1])
+    registration_method.SetSmoothingSigmasPerLevel([2, 1, 0])
+
+    # ----------------------------------------------
+    #         TRANSFORMATION MATRIX
+    # ----------------------------------------------  
+
+    # Execute registration
+    final_transform = registration_method.Execute(fixed_image_gray, moving_image_gray)
+
+    # Extract parameters from the final transform
+    parameters = final_transform.GetParameters()
+    scale = parameters[0]
+    angle = parameters[1]
+    tx = parameters[2]
+    ty = parameters[3]
+
+    # Construct the affine matrix
+    cos_theta = np.cos(angle)
+    sin_theta = np.sin(angle)
+
+    # Similarity transform matrix
+    affine_matrix = np.array([
+        [scale * cos_theta, -scale * sin_theta, tx],
+        [scale * sin_theta,  scale * cos_theta, ty],
+        [0,                 0,                 1]
+    ])
+    rotation_degrees, offset_x, offset_y, scaling = metrics_registration(
+        affine_matrix
+    )
+
+    # ----------------------------------------------
+    #         GC POST TO BDSA
+    # ----------------------------------------------
+
     try:
-        # Convert to SimpleITK format - use grayscale for registration
-        fixed_img = sitk.GetImageFromArray(fixed_gray)
-        moving_img = sitk.GetImageFromArray(
-            cv2.cvtColor(moving_image_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-            / 255.0
-        )
+        all_item_data = gc.getItem(moving_id)
+        item_meta = all_item_data["meta"]
+        item_meta["XFM"] = affine_matrix
 
-        # Define a similarity transform
-        transform = sitk.Similarity2DTransform()
+        all_item_data["meta"]["npReg"] = {
+            "srcImage": fixed_id,
+            "xOffset": offset_x,
+            "yOffset": offset_y,
+            "scale": scaling,
+            "rotation": rotation_degrees,
+            "regImageSize": size,
+        }
+        item_meta["npReg"] = all_item_data["meta"]["npReg"]
 
-        # Initialize transform by aligning centers
-        initial_transform = sitk.CenteredTransformInitializer(
-            fixed_img,
-            moving_img,
-            transform,
-            sitk.CenteredTransformInitializerFilter.GEOMETRY,
-        )
-
-        # Set up registration
-        registration_method = sitk.ImageRegistrationMethod()
-
-        # Use mutual information metric
-        registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-
-        # Configure gradient descent optimizer
-        registration_method.SetOptimizerAsGradientDescent(
-            learningRate=0.1,
-            numberOfIterations=200,
-            convergenceMinimumValue=1e-6,
-            convergenceWindowSize=10,
-        )
-
-        # Set interpolator
-        registration_method.SetInterpolator(sitk.sitkLinear)
-
-        # Apply initial transform
-        registration_method.SetInitialTransform(initial_transform, inPlace=True)
-
-        # Balance parameter updates
-        registration_method.SetOptimizerScalesFromPhysicalShift()
-
-        # Use multi-resolution for robustness
-        registration_method.SetShrinkFactorsPerLevel([4, 2, 1])
-        registration_method.SetSmoothingSigmasPerLevel([2, 1, 0])
-
-        # Execute registration
-        final_transform = registration_method.Execute(fixed_img, moving_img)
-
-        # Extract parameters from the final transform
-        parameters = final_transform.GetParameters()
-        scale = parameters[0]
-        angle = parameters[1]
-        tx = parameters[2]
-        ty = parameters[3]
-
-        # Construct the affine matrix
-        cos_theta = np.cos(angle)
-        sin_theta = np.sin(angle)
-
-        # Similarity transform matrix
-        affine_matrix = np.array(
-            [
-                [scale * cos_theta, -scale * sin_theta, tx],
-                [scale * sin_theta, scale * cos_theta, ty],
-                [0, 0, 1],
-            ]
-        )
-        rotation_degrees, offset_x, offset_y, scaling = metrics_registration(
-            affine_matrix
-        )
-
-        # ----------------------------------------------
-        #         GC POST TO BDSA
-        # ----------------------------------------------
-
-        try:
-            all_item_data = gc.getItem(moving_id)
-            item_meta = all_item_data["meta"]
-            item_meta["XFM"] = affine_matrix
-
-            all_item_data["meta"]["npReg"] = {
-                "srcImage": fixed_id,
-                "xOffset": offset_x,
-                "yOffset": offset_y,
-                "scale": scaling,
-                "rotation": rotation_degrees,
-                "regImageSize": size,
-            }
-            item_meta["npReg"] = all_item_data["meta"]["npReg"]
-
-            all_item_data["meta"] = item_meta
-            xfm_dict = item_meta["XFM"]
-            xfm_dict = {i: list(xfm_dict[i]) for i in range(xfm_dict.shape[0])}
-            xfm_json = json.dumps(xfm_dict)
-            item_meta["XFM"] = xfm_json
-            gc.addMetadataToItem(moving_id, item_meta)
-        except Exception as e:
-            print(f"Error updating metadata: {str(e)}")
-
-        return affine_matrix, moving_image_rgb
-
+        all_item_data["meta"] = item_meta
+        xfm_dict = item_meta["XFM"]
+        xfm_dict = {i: list(xfm_dict[i]) for i in range(xfm_dict.shape[0])}
+        xfm_json = json.dumps(xfm_dict)
+        item_meta["XFM"] = xfm_json
+        gc.addMetadataToItem(moving_id, item_meta)
     except Exception as e:
-        print(f"Error in registration: {str(e)}")
-        # Return identity transform and original image if registration fails
-        return np.eye(3), moving_image_rgb
+        print(f"Error updating metadata: {str(e)}")
+
+    # return affine_matrix, moving_image_rgb
+
+    # ----------------------------------------------
+    #         TRANSFORMATION MATRIX
+    # ----------------------------------------------  
+
+    # Resample each color channel separately and cast to uint8
+    registered_channels = []
+    for channel in range(moving_img.GetNumberOfComponentsPerPixel()):
+        moving_channel = sitk.VectorIndexSelectionCast(
+            moving_img, channel,
+            sitk.sitkFloat32)
+        registered_channel = sitk.Resample(
+            moving_channel,
+            fixed_image_gray,
+            final_transform,
+            sitk.sitkLinear,
+            0.0
+        )
+        registered_channel_uint8 = sitk.Cast(
+            registered_channel,
+            sitk.sitkUInt8
+            )
+        registered_channels.append(registered_channel_uint8)
+
+    # Combine the registered channels into a color image
+    registered_image = sitk.Compose(registered_channels)
+
+    # Save the result
+    # os.makedirs( f'registered/{case}/{subcase}', exist_ok=True)
+    # sitk.WriteImage(registered_image, f'registered/{case}/{subcase}/{reg_name}.jpg')
+
+    reg_image = sitk.GetArrayFromImage(registered_image)
+    np_image = sitk.GetArrayFromImage(fixed_img).astype("uint8")
+
+    mask_reg = prepare_mask_exit(reg_image)
+    mask_orig = prepare_mask_exit(np_image)
+
+    # Determine the orientation
+    prev_dice = dice
+    dice = dice_coefficient(mask_orig, mask_reg)
+    print(dice)
+
+    print("Affine Matrix:\n", affine_matrix)
+    return affine_matrix, reg_image, registered_image
+    # except Exception as e:
+    #     print(f"Error in registration: {str(e)}")
+    #     # Return identity transform and original image if registration fails
+    #     return np.eye(3), moving_image_rgb

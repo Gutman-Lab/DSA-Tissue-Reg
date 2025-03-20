@@ -12,6 +12,8 @@ from components.carlos_reg_utils import (
 import cv2
 import base64
 import numpy as np
+import SimpleITK as sitk
+
 
 ## Good exaples to start with..
 caseList = [
@@ -119,6 +121,8 @@ def update_folder_contents(selected_case_id):
     Input("folder-contents-grid", "selectedRows"),
 )
 def update_registered_image(selected_rows):
+    print("SELECTED ROWS")
+    print(selected_rows)
     if not selected_rows or len(selected_rows) == 0:
         return ""
 
@@ -129,18 +133,22 @@ def update_registered_image(selected_rows):
     print("Selected target:", target_id)
 
     # Get the registered image
-    reg_matrix, reg_image = register_fixed_moving(src_image_id, target_id)
+    reg_matrix, reg_image, registered_image = register_fixed_moving(src_image_id, target_id)
     print("Registration matrix shape:", reg_matrix.shape)
     print("Registration matrix:\n", reg_matrix)
     print("Registered image shape:", reg_image.shape)
     print("Registered image dtype:", reg_image.dtype)
     print("Registered image min/max:", np.min(reg_image), np.max(reg_image))
 
-    resampled_image = apply_affine_transform(reg_image, reg_matrix)
+    resampled_image = sitk.GetArrayFromImage(registered_image)
+    resampled_image = resampled_image[..., ::-1]
+
+    # resampled_image = apply_affine_transform(registered_image, reg_matrix)
     print("Resampled image shape:", resampled_image.shape)
     print("Resampled image dtype:", resampled_image.dtype)
     print("Resampled image min/max:", np.min(resampled_image), np.max(resampled_image))
 
+    '''
     # Convert to uint8 if not already
     if resampled_image.dtype != np.uint8:
         print("Converting to uint8...")
@@ -149,7 +157,7 @@ def update_registered_image(selected_rows):
             "After uint8 conversion min/max:",
             np.min(resampled_image),
             np.max(resampled_image),
-        )
+        )'''
 
     # Convert grayscale to RGB if needed
     if len(resampled_image.shape) == 2:
