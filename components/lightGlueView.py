@@ -123,7 +123,7 @@ def match_images(img0, img1):
 # Layout for the LightGlue test component
 lightGlue_layout = html.Div(
     [
-        html.H2("LightGlue Feature Matching", className="mb-4"),
+        # html.H2("LightGlue Feature Matching", className="mb-4"),
         # Image selection table
         html.Div(
             [
@@ -157,12 +157,13 @@ lightGlue_layout = html.Div(
             ],
             className="mb-4",
         ),
-        # Image previews
+        # Combined row for image previews and results
         html.Div(
             [
-                html.H4("Selected Images", className="mb-3"),
+                # html.H4("Image Registration", className="mb-3"),
                 dbc.Row(
                     [
+                        # Fixed image preview
                         dbc.Col(
                             [
                                 html.H5("Fixed Image", className="mb-2"),
@@ -180,8 +181,9 @@ lightGlue_layout = html.Div(
                                     },
                                 ),
                             ],
-                            width=6,
+                            width=3,
                         ),
+                        # Moving image preview
                         dbc.Col(
                             [
                                 html.H5("Moving Image", className="mb-2"),
@@ -199,6 +201,27 @@ lightGlue_layout = html.Div(
                                     },
                                 ),
                             ],
+                            width=3,
+                        ),
+                        # Feature matching results
+                        dbc.Col(
+                            [
+                                html.Div(
+                                    [
+                                        html.H5("Feature Matches", className="mb-2"),
+                                        dbc.Button(
+                                            "Run Feature Matching",
+                                            id="run-feature-matching",
+                                            color="primary",
+                                            className="mb-2",
+                                        ),
+                                        dbc.Spinner(
+                                            html.Div(id="feature-matching-status")
+                                        ),
+                                        html.Div(id="feature-matching-results"),
+                                    ]
+                                ),
+                            ],
                             width=6,
                         ),
                     ],
@@ -206,21 +229,6 @@ lightGlue_layout = html.Div(
                 ),
             ]
         ),
-        # Run button
-        html.Div(
-            [
-                dbc.Button(
-                    "Run Feature Matching",
-                    id="run-feature-matching",
-                    color="primary",
-                    className="me-2",
-                ),
-                dbc.Spinner(html.Div(id="feature-matching-status")),
-            ],
-            className="mb-4",
-        ),
-        # Results section
-        html.Div(id="feature-matching-results"),
     ]
 )
 
