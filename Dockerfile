@@ -21,7 +21,7 @@ RUN chmod -R 777 /home/app
 
 ## It's possible if I don't build on a MAC I may need not this.. TODO is change to linux/amd64 build
 RUN apt-get update
-RUN apt-get install -y libglib2.0-0 libsm6 libxrender1 libxext6 libgl1-mesa-glx 
+RUN apt-get install -y libglib2.0-0 libsm6 libxrender1 libxext6 libgl1-mesa-glx git
 USER app
 RUN pip install dash_paperdragon==0.1.11
 # Run the web service on container startup. Here we use the gunicorn
@@ -34,6 +34,8 @@ RUN pip install scikit-learn
 RUN pip install matplotlib
 RUN pip install SimpleITK
 RUN pip install scikit-image
+# Install LightGlue directly from GitHub
+RUN pip install git+https://github.com/cvg/LightGlue.git
 
 EXPOSE 8050
 #CMD exec gunicorn --bind 0.0.0.0:6667 --log-level info --workers 1 --timeout 0 --reload app:server
