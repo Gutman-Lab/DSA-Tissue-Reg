@@ -182,7 +182,6 @@ caseSelection_layout = html.Div(
     },
     children=[
         filter_controls,
-        dcc.Store(id="case_images_store", data=[]),
         html.Div(
             style={
                 "flex": "0 0 auto",
@@ -223,7 +222,7 @@ def clear_cache_and_refresh(n_clicks):
 
 # Callback to update the case images store when a case is selected
 @callback(Output("case_images_store", "data"), Input("caseSelect", "value"))
-@memory.cache
+# @memory.cache
 def update_case_images(caseFolderId):
     if not caseFolderId:
         return []
