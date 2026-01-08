@@ -1,0 +1,109 @@
+# Development override for docker-compose.yml
+# Use: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+# This enables live reload for both frontend and backend
+#
+# User ID mapping: Uses host user's UID/GID to ensure proper file permissions
+# These are set via environment variables (see run-docker.sh)
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: vite-reg-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - vite-reg-network
+    volumes:
+      - redis-data:/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    user: "${USER_ID}:${GROUP_ID}"
+    # Override command for development with hot reload
+    # --reload enables auto-reload on file changes
+    # --reload-dir specifies which directories to watch
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/app --reload-dir /app
+    volumes:
+      # Mount entire backend directory for live reload
+      - ./backend:/app
+      # Exclude Python cache (use anonymous volume to prevent sync issues)
+      - /app/__pycache__
+      - /app/.pytest_cache
+      - backend-cache:/app/.npCacheDir
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DSA_BASE_URL=${DSA_BASE_URL:-http://bdsa.pathology.emory.edu:8080/api/v1}
+      - DSAKEY=${DSAKEY:-}
+      - CACHE_DIR=/app/.npCacheDir
+
+  frontend:
+    # Use development server instead of nginx
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    user: "${USER_ID}:${GROUP_ID}"
+    ports:
+      - "5173:5173"
+    volumes:
+      # Mount all source files for live reload
+      - ./src:/app/src
+      - ./public:/app/public
+      - ./index.html:/app/index.html
+      - ./vite.config.ts:/app/vite.config.ts
+      - ./tsconfig.json:/app/tsconfig.json
+      - ./tsconfig.app.json:/app/tsconfig.app.json
+      - ./tsconfig.node.json:/app/tsconfig.node.json
+      - ./package.json:/app/package.json
+      - ./package-lock.json:/app/package-lock.json
+      # Exclude node_modules to use container's version (prevents conflicts)
+      - /app/node_modules
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api
+      - CHOKIDAR_USEPOLLING=true  # Enable polling for file changes in Docker (required for WSL/Docker)
+      - WATCHPACK_POLLING=true     # Additional polling option
+    command: npm run dev -- --host 0.0.0.0
+    depends_on:
+      - backend
+      - redis
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    user: "${USER_ID}:${GROUP_ID}"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DSA_BASE_URL=${DSA_BASE_URL:-http://bdsa.pathology.emory.edu:8080/api/v1}
+      - DSAKEY=${DSAKEY:-}
+      - CACHE_DIR=/app/.npCacheDir
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+      - /app/.pytest_cache
+      - backend-cache:/app/.npCacheDir
+    networks:
+      - vite-reg-network
+    depends_on:
+      - redis
+      - backend
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+
+volumes:
+  backend-cache:
+  redis-data:
+
+networks:
+  vite-reg-network:
+    driver: bridge
+

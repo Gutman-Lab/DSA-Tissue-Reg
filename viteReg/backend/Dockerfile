@@ -1,0 +1,52 @@
+# Use the official lightweight Python image
+FROM python:3.11-slim-bullseye
+
+# Build arguments for user ID mapping
+ARG USER_ID=1000
+ARG GROUP_ID=1000
+
+# Set environment variables
+ENV APP_HOME=/app
+ENV PYTHONUNBUFFERED=True
+WORKDIR $APP_HOME
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libglib2.0-0 \
+    libsm6 \
+    libxrender1 \
+    libxext6 \
+    libgl1-mesa-glx \
+    git \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
+COPY . .
+
+# Setup user with matching UID/GID from host
+# This ensures files created in container have correct permissions on host
+RUN groupadd -g ${GROUP_ID} appuser || true && \
+    useradd -u ${USER_ID} -g ${GROUP_ID} -m -s /bin/bash appuser || true && \
+    mkdir -p /home/appuser && \
+    chown -R ${USER_ID}:${GROUP_ID} /home/appuser /app
+
+# Create cache directory with correct ownership
+RUN mkdir -p /app/.npCacheDir && \
+    chown -R ${USER_ID}:${GROUP_ID} /app/.npCacheDir
+
+# Pre-download models (if needed) as the app user
+USER appuser
+RUN mkdir -p /home/appuser/.cache/torch/hub/checkpoints && \
+    wget -O /home/appuser/.cache/torch/hub/checkpoints/superpoint_v1.pth https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth && \
+    wget -O /home/appuser/.cache/torch/hub/checkpoints/superpoint_lightglue_v0-1_arxiv.pth https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_lightglue.pth || true
+
+EXPOSE 8000
+
+# Run with Uvicorn as appuser
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+

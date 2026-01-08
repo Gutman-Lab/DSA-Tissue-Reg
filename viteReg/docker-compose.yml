@@ -1,0 +1,92 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: vite-reg-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - vite-reg-network
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    container_name: vite-reg-backend
+    user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+    ports:
+      - "8000:8000"
+    environment:
+      - DSA_BASE_URL=${DSA_BASE_URL:-http://bdsa.pathology.emory.edu:8080/api/v1}
+      - DSAKEY=${DSAKEY:-}
+      - CACHE_DIR=/app/.npCacheDir
+    volumes:
+      - ./backend:/app
+      - backend-cache:/app/.npCacheDir
+    networks:
+      - vite-reg-network
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    container_name: vite-reg-worker
+    user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+    environment:
+      - DSA_BASE_URL=${DSA_BASE_URL:-http://bdsa.pathology.emory.edu:8080/api/v1}
+      - DSAKEY=${DSAKEY:-}
+      - CACHE_DIR=/app/.npCacheDir
+    volumes:
+      - ./backend:/app
+      - backend-cache:/app/.npCacheDir
+    networks:
+      - vite-reg-network
+    depends_on:
+      - redis
+      - backend
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    container_name: vite-reg-frontend
+    user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    volumes:
+      # For development: mount source code for hot reload
+      - ./src:/app/src:ro
+      - ./public:/app/public:ro
+      - ./index.html:/app/index.html:ro
+      - ./vite.config.ts:/app/vite.config.ts:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
+      - ./package.json:/app/package.json:ro
+    networks:
+      - vite-reg-network
+    restart: unless-stopped
+
+volumes:
+  backend-cache:
+  redis-data:
+
+networks:
+  vite-reg-network:
+    driver: bridge
+

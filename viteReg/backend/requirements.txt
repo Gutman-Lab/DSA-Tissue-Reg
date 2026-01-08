@@ -1,0 +1,40 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# DSA Integration
+girder-client==3.1.20
+pymongo==4.10.1
+
+# Image Processing
+opencv-python==4.10.0.84
+opencv-contrib-python==4.10.0.84  # For TPS: cv2.createThinPlateSplineShapeTransformer
+Pillow==11.0.0
+numpy==1.24.2
+scipy
+scikit-image
+SimpleITK
+kornia
+
+# Deep Learning
+torch==2.5.1
+torchvision==0.20.1
+transformers==4.47.0
+accelerate==1.2.0
+
+# Data Handling
+pandas==1.5.3
+
+# Caching
+diskcache==5.6.1
+joblib==1.4.2
+
+# Task Queue
+celery==5.4.0
+redis==5.2.0
+
+# LightGlue - install from GitHub for latest version
+git+https://github.com/cvg/LightGlue.git
+

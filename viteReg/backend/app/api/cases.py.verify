@@ -1,0 +1,40 @@
+"""
+Script to verify if hard-coded case folders still exist in DSA
+Run this to check: python -m app.api.cases.verify
+"""
+import asyncio
+from app.services.dsa_client import get_dsa_client
+from app.api.cases import CASE_LIST
+
+async def verify_cases():
+    """Check which hard-coded cases still exist"""
+    dsa = get_dsa_client()
+    
+    print("Verifying hard-coded cases...")
+    print("-" * 60)
+    
+    existing = []
+    missing = []
+    
+    for case in CASE_LIST:
+        exists = dsa.folder_exists(case["value"])
+        if exists:
+            existing.append(case)
+            print(f"✓ {case['label']} ({case['value']}) - EXISTS")
+        else:
+            missing.append(case)
+            print(f"✗ {case['label']} ({case['value']}) - MISSING")
+    
+    print("-" * 60)
+    print(f"Found: {len(existing)}/{len(CASE_LIST)} cases exist")
+    
+    if missing:
+        print("\nMissing cases:")
+        for case in missing:
+            print(f"  - {case['label']} ({case['value']})")
+    
+    return existing, missing
+
+if __name__ == "__main__":
+    asyncio.run(verify_cases())
+
