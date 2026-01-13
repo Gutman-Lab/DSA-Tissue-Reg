@@ -31,3 +31,4 @@ dist-ssr
 
 # Docker
 .dockerignore
+.npCacheDir/**

@@ -1,0 +1,8 @@
+bdsa_url: http://bdsa.pathology.emory.edu:8080/api/v1/item
+url2: tiles/thumbnail?width=1024&encoding=JPEG
+ftype: "accept: image/jpeg"
+folder_id: 673145a3900c0c05599c04e7
+size: 1024
+region: Hippocampus
+acc: ''
+passw: ''

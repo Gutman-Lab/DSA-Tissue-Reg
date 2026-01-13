@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { autoRegisterCase, getRegistrationStatus, loadStoredRegistrations, type RegistrationResult } from '../services/registration'
 import { getSlideInfo } from '../services/cases'
 import type { Slide } from '../types'
@@ -9,7 +9,7 @@ interface RegistrationPanelProps {
   movingSlides: Slide[]
   onRegistrationComplete?: (result: RegistrationResult) => void
   onRegistrationStatusUpdate?: (result: RegistrationResult) => void
-  registrationMethod?: 'simpleitk' | 'tps' | 'affine_tps'
+  registrationMethod?: 'simpleitk' | 'affine_tps'
 }
 
 export function RegistrationPanel({
@@ -99,9 +99,8 @@ export function RegistrationPanel({
 
   const [loadingStored, setLoadingStored] = useState(false)
 
-  const handleLoadStored = async () => {
+  const handleLoadStored = useCallback(async () => {
     if (!caseId || !fixedSlide) {
-      alert('Please select a case with a fixed (HE) image')
       return
     }
 
@@ -129,7 +128,14 @@ export function RegistrationPanel({
     } finally {
       setLoadingStored(false)
     }
-  }
+  }, [caseId, fixedSlide, registrationMethod, onRegistrationStatusUpdate])
+
+  // Auto-load stored registrations when caseId, fixedSlide, or method changes
+  useEffect(() => {
+    if (caseId && fixedSlide) {
+      handleLoadStored()
+    }
+  }, [caseId, fixedSlide?.id, registrationMethod, handleLoadStored])
 
   const allComplete = jobIds.length === 0 && results.size > 0
   const hasFailures = Array.from(results.values()).some((r) => r.status === 'failed')
@@ -314,7 +320,7 @@ export function RegistrationPanel({
                             {' | '}
                             Rot: {result.rotation_degrees.toFixed(1)}° | Scale: {result.scale.toFixed(3)}
                             {/* Show match counts for LightGlue/TPS */}
-                            {(result.method === 'tps' || result.method === 'affine_tps') && (
+                            {(result.method === 'affine_tps') && (
                               <>
                                 {' | '}
                                 <span style={{ fontSize: '0.7rem', color: '#7f8c8d' }}>

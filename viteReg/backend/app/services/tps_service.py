@@ -28,6 +28,82 @@ except ImportError:
     logger.warning("scipy not available. Install with: pip install scipy")
 
 
+def _filter_spatial_consistency(
+    points0: np.ndarray,
+    points1: np.ndarray,
+    max_neighbor_distance_ratio: float = 2.0,
+    k_neighbors: int = 5
+) -> np.ndarray:
+    """
+    Filter matches to enforce spatial consistency (topographic constraint)
+    
+    For each match, check if nearby points in image0 match to nearby points in image1.
+    This enforces that local spatial relationships are preserved.
+    
+    Args:
+        points0: Matched points in image0 (N, 2)
+        points1: Matched points in image1 (N, 2)
+        max_neighbor_distance_ratio: Maximum ratio of neighbor distances between images
+        k_neighbors: Number of nearest neighbors to check
+    
+    Returns:
+        Boolean array indicating which matches pass spatial consistency check
+    """
+    from sklearn.neighbors import NearestNeighbors
+    
+    if len(points0) < k_neighbors + 1:
+        # Not enough points to check spatial consistency
+        return np.ones(len(points0), dtype=bool)
+    
+    try:
+        # Find k nearest neighbors for each point in image0
+        nn0 = NearestNeighbors(n_neighbors=min(k_neighbors + 1, len(points0)), metric='euclidean')
+        nn0.fit(points0)
+        distances0, indices0 = nn0.kneighbors(points0)
+        
+        # Find k nearest neighbors for each point in image1
+        nn1 = NearestNeighbors(n_neighbors=min(k_neighbors + 1, len(points1)), metric='euclidean')
+        nn1.fit(points1)
+        distances1, indices1 = nn1.kneighbors(points1)
+        
+        # For each match, check if neighbors in image0 correspond to neighbors in image1
+        valid = np.ones(len(points0), dtype=bool)
+        
+        for i in range(len(points0)):
+            # Get neighbors of point i in image0 (skip self, index 0)
+            neighbors0 = set(indices0[i, 1:])  # Skip first (self)
+            
+            # Get neighbors of point i in image1 (skip self, index 0)
+            neighbors1 = set(indices1[i, 1:])  # Skip first (self)
+            
+            # Check how many neighbors are shared (should be high for good matches)
+            # A match is valid if at least some neighbors are also matched to neighbors
+            shared_neighbors = 0
+            for j in neighbors0:
+                if j < len(points1) and j in neighbors1:
+                    # Check if the distance ratios are reasonable
+                    dist0 = distances0[i, list(indices0[i]).index(j)]
+                    dist1 = distances1[i, list(indices1[i]).index(j)]
+                    if dist0 > 0 and dist1 > 0:
+                        ratio = max(dist0 / dist1, dist1 / dist0)
+                        if ratio < max_neighbor_distance_ratio:
+                            shared_neighbors += 1
+            
+            # Require at least 2 shared neighbors (or 30% of neighbors, whichever is less)
+            min_shared = min(2, max(1, int(len(neighbors0) * 0.3)))
+            if shared_neighbors < min_shared:
+                valid[i] = False
+        
+        return valid
+    except ImportError:
+        # sklearn not available, skip spatial filtering
+        logger.warning("sklearn not available, skipping spatial consistency filtering")
+        return np.ones(len(points0), dtype=bool)
+    except Exception as e:
+        logger.warning(f"Spatial consistency filtering failed: {e}, using all matches")
+        return np.ones(len(points0), dtype=bool)
+
+
 def apply_tps_warp(
     src_img: np.ndarray,
     src_points: np.ndarray,
@@ -366,7 +442,7 @@ def register_with_tps(
 def register_with_affine_tps(
     fixed_id: str,
     moving_id: str,
-    extractor_type: str = "superpoint",
+    extractor_type: str = "disk",  # Changed default: DISK often works better for different stains than SuperPoint
     thumbnail_width: int = 1024,
     max_keypoints: int = 2048,
     device: Optional[str] = None,
@@ -520,8 +596,33 @@ def register_with_affine_tps(
             raise ValueError("LightGlue output missing 'matches'")
         
         m = matches01["matches"]  # Shape: (K, 2)
+        match_confidence = matches01.get('matching_scores', None)
+        
         if m.numel() == 0:
             raise ValueError("No matches returned by LightGlue")
+        
+        # Filter matches by confidence if available
+        # This helps remove poor quality matches that can cause bad registration
+        if match_confidence is not None:
+            confidence_threshold = 0.2  # Stricter threshold for better quality matches
+            valid_matches = match_confidence > confidence_threshold
+            m = m[valid_matches]
+            match_confidence = match_confidence[valid_matches]
+            logger.info(f"Filtered matches by confidence: {len(m)} matches above threshold {confidence_threshold} (from {len(matches01['matches'])})")
+            
+            if len(m) < 3:
+                logger.warning(f"After confidence filtering, only {len(m)} matches remain. Lowering threshold to 0.1...")
+                confidence_threshold = 0.1
+                m = matches01["matches"]
+                match_confidence = matches01.get('matching_scores', None)
+                if match_confidence is not None:
+                    valid_matches = match_confidence > confidence_threshold
+                    m = m[valid_matches]
+                    match_confidence = match_confidence[valid_matches]
+                    logger.info(f"After lowering threshold: {len(m)} matches")
+        
+        if len(m) < 3:
+            raise ValueError(f"Not enough matches after filtering: {len(m)}. Need at least 3 for affine transform.")
         
         # Gather matched keypoints
         k0 = feats0["keypoints"]  # Shape: (N, 2)
@@ -533,10 +634,17 @@ def register_with_affine_tps(
         p0 = points0.detach().cpu().numpy().astype(np.float32)
         p1 = points1.detach().cpu().numpy().astype(np.float32)
         
-        if len(p0) < 3:
-            raise ValueError(f"Not enough matches for affine (need >= 3, got {len(p0)})")
+        logger.info(f"Using {len(p0)} feature matches for affine estimation (confidence filtered)")
         
-        logger.info(f"Found {len(p0)} feature matches")
+        # Optional: Filter matches by spatial consistency (topographic constraint)
+        # Remove matches where nearby points in one image match to far-away points in the other
+        # This helps enforce that local spatial relationships are preserved
+        if len(p0) > 10:  # Only do this if we have enough matches
+            spatial_consistent = _filter_spatial_consistency(p0, p1, max_neighbor_distance_ratio=2.0)
+            p0 = p0[spatial_consistent]
+            p1 = p1[spatial_consistent]
+            m = m[spatial_consistent]
+            logger.info(f"After spatial consistency filtering: {len(p0)} matches remain")
         
         # Step 2: Coarse affine with RANSAC
         # cv2.estimateAffine2D(src, dst) estimates transform: src -> dst
@@ -562,12 +670,21 @@ def register_with_affine_tps(
         num_inliers = len(p0_in)
         logger.info(f"Affine RANSAC found {num_inliers} inliers out of {len(p0)} matches")
         
-        # Warp moving image by affine
+        # cv2.estimateAffine2D returns transform: moving -> fixed
+        # But cv2.warpAffine needs: fixed -> moving (inverse)
+        # So we need to invert A before using it with warpAffine
+        # Convert A to 3x3 homogeneous matrix for inversion
+        A_3x3 = np.vstack([A, [0, 0, 1]])
+        A_inv_3x3 = np.linalg.inv(A_3x3)
+        A_inv = A_inv_3x3[:2, :].astype(np.float32)
+        
+        # Warp moving image by inverse affine transform
         out_hw = fixed_bgr.shape[:2]
-        moving_affine = cv2.warpAffine(moving_bgr, A, (out_hw[1], out_hw[0]), flags=cv2.INTER_LINEAR)
+        moving_affine = cv2.warpAffine(moving_bgr, A_inv, (out_hw[1], out_hw[0]), flags=cv2.INTER_LINEAR)
         
         # Extract affine transform parameters for return
-        # A is 2x3: [a00 a01 tx; a10 a11 ty]
+        # A is 2x3: [a00 a01 tx; a10 a11 ty] - this maps moving -> fixed
+        # For display, we want the forward transform (moving -> fixed)
         rotation_degrees = float(np.degrees(np.arctan2(A[1, 0], A[0, 0])))
         scale_x = np.sqrt(A[0, 0]**2 + A[0, 1]**2)
         scale_y = np.sqrt(A[1, 0]**2 + A[1, 1]**2)
@@ -575,7 +692,7 @@ def register_with_affine_tps(
         offset_x = float(A[0, 2])
         offset_y = float(A[1, 2])
         
-        # Convert to 3x3 homogeneous matrix
+        # Convert to 3x3 homogeneous matrix (for storage - this is moving -> fixed)
         A_3x3 = np.vstack([A, [0, 0, 1]])
         
         # Step 3: TPS refinement (if enough inliers)
@@ -595,17 +712,29 @@ def register_with_affine_tps(
                 notes.append(f"Subsampled TPS control points to {max_matches_for_tps}")
             
             # TPS maps from affine-warped coordinates to fixed image coordinates
-            # p0_in are points in ORIGINAL moving image, p1_in are in fixed image
-            # We need to transform p0_in by A to get points in moving_affine space
-            ones = np.ones((p0_in.shape[0], 1), dtype=np.float32)
-            p0_h = np.concatenate([p0_in, ones], axis=1)  # (N,3)
-            p0_aff = (A @ p0_h.T).T.astype(np.float32)  # (N,2) - points in moving_affine space
+            # p1_in are points in ORIGINAL moving image (inliers from RANSAC)
+            # p0_in are points in fixed image (corresponding inliers)
+            # A maps p1_in -> p0_in (approximately, since inliers)
+            # After warping moving by A_inv, moving_affine is in fixed space
+            # For TPS refinement: we want to map from moving_affine to fixed
+            # The source points should be where p1_in ended up in moving_affine
+            # Since A maps p1_in->p0_in, after warping by A_inv, p1_in are at approximately p0_in
+            # But for exact TPS, we use the actual transformed locations
+            ones = np.ones((p1_in.shape[0], 1), dtype=np.float32)
+            p1_h = np.concatenate([p1_in, ones], axis=1)  # (N,3)
+            # Transform p1_in by A to get where they are in fixed space (should be ~p0_in for inliers)
+            p1_in_fixed = (A @ p1_h.T).T.astype(np.float32)  # (N,2) - where p1_in are after affine warp
             
-            src = p0_aff.reshape(-1, 1, 2)  # source points in moving_affine space
-            dst = p1_in.reshape(-1, 1, 2)   # destination points in fixed image space
+            # For TPS: source = p1_in_fixed (locations in moving_affine/fixed), dest = p0_in (target in fixed)
+            # Since they're inliers, p1_in_fixed ≈ p0_in, so TPS will do fine local refinement
+            src = p1_in_fixed.reshape(-1, 1, 2)  # source points in moving_affine (fixed space)
+            dst = p0_in.reshape(-1, 1, 2)   # destination points in fixed image space
+            
+            src = p1_in_fixed.reshape(-1, 1, 2)  # source points in moving_affine space
+            dst = p0_in.reshape(-1, 1, 2)   # destination points in fixed image space
             
             # DMatch pairs
-            dmatches = [cv2.DMatch(i, i, 0) for i in range(len(p0_aff))]
+            dmatches = [cv2.DMatch(i, i, 0) for i in range(len(p1_in_fixed))]
             
             # Estimate TPS transform
             tps = cv2.createThinPlateSplineShapeTransformer()
@@ -617,10 +746,10 @@ def register_with_affine_tps(
             H, W = out_hw
             
             # Convert control points to the format expected by apply_tps_warp
-            # p0_aff are points in moving_affine space (source)
-            # p1_in are points in fixed image space (destination)
-            src_points = p0_aff.astype(np.float64)  # (N, 2) - points in moving_affine space
-            dst_points = p1_in.astype(np.float64)    # (N, 2) - points in fixed image space
+            # p1_in_fixed are points in moving_affine space (source, after affine warp)
+            # p0_in are points in fixed image space (destination)
+            src_points = p1_in_fixed.astype(np.float64)  # (N, 2) - points in moving_affine space
+            dst_points = p0_in.astype(np.float64)    # (N, 2) - points in fixed image space
             
             # Apply TPS warp using scipy-based implementation
             moving_tps = apply_tps_warp(
@@ -656,27 +785,57 @@ def register_with_affine_tps(
         ssim_score = calculate_structural_similarity(fixed_gray, moving_gray)
         
         # Calculate Dice on masks
+        # Note: For registered images, we don't need to test rotations - they should already be aligned
+        # Different stains may produce different mask shapes even with good registration,
+        # so Dice might be lower than expected for different stain types
         mask1 = prepare_mask_exit(fixed_gray, method="otsu")
         mask2 = prepare_mask_exit(moving_gray, method="otsu")
+        
+        # Ensure masks are same size (they should be after registration, but check anyway)
         h1, w1 = mask1.shape
         h2, w2 = mask2.shape
-        max_dim = max(h1, w1, h2, w2)
-        padded_mask1 = pad_to_size(mask1, max_dim)
-        padded_mask2 = pad_to_size(mask2, max_dim)
-        _, dice = find_relative_rotation(padded_mask1, padded_mask2)
+        if h1 != h2 or w1 != w2:
+            # Resize mask2 to match mask1
+            mask2 = cv2.resize(mask2, (w1, h1), interpolation=cv2.INTER_NEAREST)
+        
+        # Convert to binary for Dice calculation
+        mask1_binary = (mask1 > 0).astype(np.uint8)
+        mask2_binary = (mask2 > 0).astype(np.uint8)
+        
+        # Calculate Dice directly (no rotation testing needed - images are already registered)
+        intersection = np.logical_and(mask1_binary, mask2_binary).sum()
+        size1 = mask1_binary.sum()
+        size2 = mask2_binary.sum()
+        dice = 2.0 * intersection / (size1 + size2) if (size1 + size2) > 0 else 0.0
+        dice = min(1.0, max(0.0, dice))  # Clamp to [0, 1]
         
         # Store match data for visualization
+        # Note: Store ALL original matches (before confidence filtering) for visualization
+        # But mark which ones passed confidence filtering
+        m_original = matches01["matches"]
+        match_confidence_original = matches01.get('matching_scores', None)
+        
         kpts0_list = k0.cpu().numpy().tolist()
         kpts1_list = k1.cpu().numpy().tolist()
-        matches_list = m.cpu().numpy().tolist()
-        match_confidence = matches01.get('matching_scores', None)
+        matches_list_original = m_original.cpu().numpy().tolist()
+        
+        # Create a mask for matches that passed confidence filtering
+        confidence_passed = None
+        if match_confidence_original is not None:
+            confidence_threshold = 0.2
+            confidence_passed = (match_confidence_original > confidence_threshold).cpu().numpy().tolist()
+            # If too few passed, use lower threshold
+            if sum(confidence_passed) < 3:
+                confidence_threshold = 0.1
+                confidence_passed = (match_confidence_original > confidence_threshold).cpu().numpy().tolist()
         
         match_data = {
             "keypoints0": [[float(x), float(y)] for x, y in kpts0_list],
             "keypoints1": [[float(x), float(y)] for x, y in kpts1_list],
-            "matches": [[int(x), int(y)] for x, y in matches_list],
-            "match_scores": [float(x) for x in match_confidence.cpu().numpy().tolist()] if match_confidence is not None else None,
+            "matches": [[int(x), int(y)] for x, y in matches_list_original],
+            "match_scores": [float(x) for x in match_confidence_original.cpu().numpy().tolist()] if match_confidence_original is not None else None,
             "inliers": [bool(x) for x in inliers_mask.tolist()],
+            "confidence_passed": confidence_passed,  # Additional info: which matches passed confidence filtering
         }
         
         return {

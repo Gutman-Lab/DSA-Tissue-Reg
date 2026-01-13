@@ -5,6 +5,7 @@ from typing import List, Optional, Literal, Dict, Any
 import uuid
 import logging
 import os
+import json
 from datetime import datetime
 from app.tasks.registration_tasks import task_register_rigid
 from app.celery_app import celery_app
@@ -67,7 +68,7 @@ class RegistrationResult(BaseModel):
     reg_image_size: Optional[int] = None  # Registration image size used
     relative_rotation: Optional[int] = None  # Relative rotation detected (0, 90, 180, 270)
     dice_coefficient: Optional[float] = None  # Dice coefficient from mask matching (best for different stains)
-    method: Optional[str] = None  # Registration method: 'simpleitk' (rigid/affine), 'tps' (non-rigid), or 'affine_tps' (affine+TPS hybrid)
+    method: Optional[str] = None  # Registration method: 'simpleitk' (rigid/affine) or 'affine_tps' (affine+TPS hybrid)
     num_matches: Optional[int] = None  # Number of feature matches (LightGlue/TPS only)
     num_inliers: Optional[int] = None  # Number of inlier matches (LightGlue/TPS only)
 
@@ -132,7 +133,7 @@ async def perform_rigid_registration(request: RegistrationRequest):
     }
     
     # Start Celery task - use apply_async with kwargs for better compatibility
-    method = request.method if hasattr(request, 'method') and request.method in ['simpleitk', 'tps', 'affine_tps'] else 'simpleitk'
+    method = request.method if hasattr(request, 'method') and request.method in ['simpleitk', 'affine_tps'] else 'simpleitk'
     task = task_register_rigid.apply_async(
         args=(job_id, request.fixed_image_id, request.moving_image_id),
         kwargs={"method": method}
@@ -239,7 +240,7 @@ async def calculate_transform(
 
 
 @router.get("/stored-registrations/{case_id}", response_model=List[RegistrationResult])
-async def list_stored_registrations(case_id: str, method: Optional[str] = Query(None, description="Filter by method: 'simpleitk', 'lightglue', or 'tps'. If None, returns all methods.")):
+async def list_stored_registrations(case_id: str, method: Optional[str] = Query(None, description="Filter by method: 'simpleitk' or 'affine_tps'. If None, returns all methods.")):
     """
     Load stored registrations for a case from DSA metadata
     
@@ -258,7 +259,7 @@ async def list_stored_registrations(case_id: str, method: Optional[str] = Query(
             item_meta = item.get("meta", {})
             
             # Check for method-specific registrations
-            methods_to_check = [method] if method else ["simpleitk", "tps", "affine_tps"]
+            methods_to_check = [method] if method else ["simpleitk", "affine_tps"]
             
             for reg_method in methods_to_check:
                 reg_key = f"npReg_{reg_method}" if reg_method != "simpleitk" else "npReg"
@@ -333,7 +334,8 @@ async def list_stored_registrations(case_id: str, method: Optional[str] = Query(
 async def auto_register_case(
     case_id: str,
     block_id: Optional[str] = Query(None, description="Block ID to filter slides (uses HE image's block ID if not provided)"),
-    method: Optional[str] = Query("simpleitk", description="Registration method: 'simpleitk' (rigid/affine), 'tps' (non-rigid), or 'affine_tps' (affine+TPS hybrid)")
+    method: Optional[str] = Query("simpleitk", description="Registration method: 'simpleitk' (rigid/affine) or 'affine_tps' (affine+TPS hybrid)"),
+    extractor_type: Optional[str] = Query("disk", description="Feature extractor for affine_tps: 'superpoint', 'disk', 'aliked', or 'sift'. DISK recommended for different stains.")
 ):
     """
     Automatically register all non-HE stains to the HE image for a case
@@ -425,16 +427,28 @@ async def auto_register_case(
             }
             
             # Validate method
-            if method not in ["simpleitk", "tps", "affine_tps"]:
+            if method not in ["simpleitk", "affine_tps"]:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Invalid method: {method}. Must be 'simpleitk', 'tps', or 'affine_tps'"
+                    detail=f"Invalid method: {method}. Must be 'simpleitk' or 'affine_tps'"
                 )
             
+            # Validate extractor_type if method is affine_tps
+            if method == "affine_tps" and extractor_type:
+                if extractor_type not in ["superpoint", "disk", "aliked", "sift"]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid extractor_type: {extractor_type}. Must be 'superpoint', 'disk', 'aliked', or 'sift'"
+                    )
+            
             # Start Celery task - use apply_async with kwargs for better compatibility
+            task_kwargs = {"method": method}
+            if method == "affine_tps" and extractor_type:
+                task_kwargs["extractor_type"] = extractor_type
+            
             task = task_register_rigid.apply_async(
                 args=(job_id, he_item["_id"], moving_item["_id"]),
-                kwargs={"method": method}
+                kwargs=task_kwargs
             )
             _registration_jobs[job_id]["celery_task_id"] = task.id
             _registration_jobs[job_id]["method"] = method
@@ -456,6 +470,148 @@ async def auto_register_case(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to start auto-registration: {str(e)}"
+        )
+
+
+@router.post("/explore-parameters")
+async def explore_registration_parameters(
+    fixed_id: str,
+    moving_id: str,
+    # LightGlue extractor parameters
+    extractor_type: str = Query("disk", description="Feature extractor: 'superpoint', 'disk', 'aliked', 'sift'"),
+    max_keypoints: int = Query(2048, description="Maximum number of keypoints"),
+    detection_threshold: Optional[float] = Query(None, description="Detection threshold (lower = more keypoints)"),
+    nms_window_size: Optional[int] = Query(None, description="NMS window size"),
+    # LightGlue matcher parameters
+    n_layers: int = Query(9, description="Number of attention layers"),
+    depth_confidence: float = Query(0.9, description="Early stopping confidence (0-1)"),
+    width_confidence: float = Query(0.99, description="Point pruning confidence (0-1)"),
+    filter_threshold: float = Query(0.1, description="Filter threshold for matches (0-1)"),
+    # Affine parameters
+    affine_ransac_thresh_px: float = Query(3.0, description="RANSAC reprojection threshold in pixels"),
+    affine_max_iters: int = Query(5000, description="Maximum RANSAC iterations"),
+    # TPS parameters
+    max_matches_for_tps: int = Query(2000, description="Maximum matches for TPS"),
+    tps_min_inliers: int = Query(30, description="Minimum inliers for TPS"),
+    thumbnail_width: int = Query(1024, description="Thumbnail width for registration")
+):
+    """
+    Run affine_tps registration with custom parameters for parameter exploration
+    
+    Returns registration results with the specified parameters.
+    This endpoint is for experimentation and comparison.
+    """
+    try:
+        from app.services.tps_service import register_with_affine_tps
+        
+        logger.info(f"Exploring parameters for fixed={fixed_id}, moving={moving_id}")
+        
+        # Build parameter dict
+        params = {
+            "extractor_type": extractor_type,
+            "thumbnail_width": thumbnail_width,
+            "max_keypoints": max_keypoints,
+            "max_matches_for_tps": max_matches_for_tps,
+            "affine_ransac_thresh_px": affine_ransac_thresh_px,
+            "affine_max_iters": affine_max_iters,
+            "tps_min_inliers": tps_min_inliers,
+            "n_layers": n_layers,
+            "depth_confidence": depth_confidence,
+            "width_confidence": width_confidence,
+            "filter_threshold": filter_threshold,
+        }
+        
+        if detection_threshold is not None:
+            params["detection_threshold"] = detection_threshold
+        if nms_window_size is not None:
+            params["nms_window_size"] = nms_window_size
+        
+        # Run registration with custom parameters
+        result = register_with_affine_tps(fixed_id, moving_id, **params)
+        
+        # Add parameter info to result
+        result["parameters"] = params
+        result["method"] = "affine_tps"
+        result["status"] = "completed" if result.get("success") else "failed"
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Parameter exploration failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Parameter exploration failed: {str(e)}"
+        )
+
+
+@router.get("/explore-parameters")
+async def explore_registration_parameters(
+    fixed_id: str = Query(..., description="Fixed image ID"),
+    moving_id: str = Query(..., description="Moving image ID"),
+    # LightGlue extractor parameters
+    extractor_type: str = Query("disk", description="Feature extractor: 'superpoint', 'disk', 'aliked', 'sift'"),
+    max_keypoints: int = Query(2048, description="Maximum number of keypoints"),
+    detection_threshold: Optional[float] = Query(None, description="Detection threshold (lower = more keypoints)"),
+    nms_window_size: Optional[int] = Query(None, description="NMS window size"),
+    # LightGlue matcher parameters
+    n_layers: int = Query(9, description="Number of attention layers"),
+    depth_confidence: float = Query(0.9, description="Early stopping confidence (0-1)"),
+    width_confidence: float = Query(0.99, description="Point pruning confidence (0-1)"),
+    filter_threshold: float = Query(0.1, description="Filter threshold for matches (0-1)"),
+    # Affine parameters
+    affine_ransac_thresh_px: float = Query(3.0, description="RANSAC reprojection threshold in pixels"),
+    affine_max_iters: int = Query(5000, description="Maximum RANSAC iterations"),
+    # TPS parameters
+    max_matches_for_tps: int = Query(2000, description="Maximum matches for TPS"),
+    tps_min_inliers: int = Query(30, description="Minimum inliers for TPS"),
+    thumbnail_width: int = Query(1024, description="Thumbnail width for registration")
+):
+    """
+    Run affine_tps registration with custom parameters for parameter exploration
+    
+    Returns registration results with the specified parameters.
+    This endpoint is for experimentation and comparison.
+    """
+    try:
+        from app.services.tps_service import register_with_affine_tps
+        
+        logger.info(f"Exploring parameters for fixed={fixed_id}, moving={moving_id}")
+        
+        # Build parameter dict
+        params = {
+            "extractor_type": extractor_type,
+            "thumbnail_width": thumbnail_width,
+            "max_keypoints": max_keypoints,
+            "max_matches_for_tps": max_matches_for_tps,
+            "affine_ransac_thresh_px": affine_ransac_thresh_px,
+            "affine_max_iters": affine_max_iters,
+            "tps_min_inliers": tps_min_inliers,
+            "n_layers": n_layers,
+            "depth_confidence": depth_confidence,
+            "width_confidence": width_confidence,
+            "filter_threshold": filter_threshold,
+        }
+        
+        if detection_threshold is not None:
+            params["detection_threshold"] = detection_threshold
+        if nms_window_size is not None:
+            params["nms_window_size"] = nms_window_size
+        
+        # Run registration with custom parameters
+        result = register_with_affine_tps(fixed_id, moving_id, **params)
+        
+        # Add parameter info to result
+        result["parameters"] = params
+        result["method"] = "affine_tps"
+        result["status"] = "completed" if result.get("success") else "failed"
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Parameter exploration failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Parameter exploration failed: {str(e)}"
         )
 
 

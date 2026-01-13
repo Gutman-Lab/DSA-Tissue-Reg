@@ -34,7 +34,7 @@ export interface RegistrationResult {
   error?: string
   created_at?: string
   completed_at?: string
-  method?: string  // Registration method: 'simpleitk' (rigid/affine) or 'tps' (non-rigid, uses LightGlue)
+  method?: string  // Registration method: 'simpleitk' (rigid/affine) or 'affine_tps' (affine+TPS hybrid, uses LightGlue)
   num_matches?: number  // Number of feature matches (LightGlue/TPS only)
   num_inliers?: number  // Number of inlier matches (LightGlue/TPS only)
 }
@@ -59,7 +59,7 @@ export async function getRegistrationStatus(
 export async function autoRegisterCase(
   caseId: string,
   blockId?: string,
-  method?: 'simpleitk' | 'tps' | 'affine_tps'
+  method?: 'simpleitk' | 'affine_tps'
 ): Promise<RegistrationResponse[]> {
   const params = new URLSearchParams()
   if (blockId) {
@@ -82,7 +82,7 @@ export async function clearCache(): Promise<{ success: boolean; message: string 
 
 export async function loadStoredRegistrations(
   caseId: string,
-  method?: 'simpleitk' | 'tps' | 'affine_tps'
+  method?: 'simpleitk' | 'affine_tps'
 ): Promise<RegistrationResult[]> {
   const params = new URLSearchParams()
   if (method) {
@@ -91,6 +91,39 @@ export async function loadStoredRegistrations(
   const query = params.toString()
   return apiClient.get<RegistrationResult[]>(
     `/registration/stored-registrations/${caseId}${query ? `?${query}` : ''}`
+  )
+}
+
+export interface ParameterExplorationParams {
+  extractor_type?: string
+  max_keypoints?: number
+  detection_threshold?: number
+  nms_window_size?: number
+  n_layers?: number
+  depth_confidence?: number
+  width_confidence?: number
+  filter_threshold?: number
+  affine_ransac_thresh_px?: number
+  affine_max_iters?: number
+  max_matches_for_tps?: number
+  tps_min_inliers?: number
+  thumbnail_width?: number
+}
+
+export async function exploreParameters(
+  fixedId: string,
+  movingId: string,
+  params: ParameterExplorationParams
+): Promise<RegistrationResult & { parameters: ParameterExplorationParams }> {
+  const queryParams = new URLSearchParams({
+    fixed_id: fixedId,
+    moving_id: movingId,
+    ...Object.fromEntries(
+      Object.entries(params).filter(([_, v]) => v !== undefined).map(([k, v]) => [k, String(v)])
+    )
+  })
+  return apiClient.get<RegistrationResult & { parameters: ParameterExplorationParams }>(
+    `/registration/explore-parameters?${queryParams.toString()}`
   )
 }
 

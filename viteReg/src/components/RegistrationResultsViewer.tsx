@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { getThumbnailUrl } from '../services/images'
 import { getSlideInfo } from '../services/cases'
 import { loadStoredRegistrations } from '../services/registration'
+import { ParameterExplorationPanel } from './ParameterExplorationPanel'
+import { FeatureMatchesCanvas } from './FeatureMatchesCanvas'
 import type { Slide } from '../types'
 import type { RegistrationResult } from '../services/registration'
 
@@ -26,18 +28,40 @@ export function RegistrationResultsViewer({
   const [vizImageUrl, setVizImageUrl] = useState<string | null>(null)
   const [vizError, setVizError] = useState<string | null>(null)
   const [vizLoading, setVizLoading] = useState(false)
+  const [matchData, setMatchData] = useState<{
+    fixed_id: string
+    moving_id: string
+    method: string
+    match_data: {
+      keypoints0: number[][]
+      keypoints1: number[][]
+      matches: number[][]
+      match_scores?: number[] | null
+      inliers?: boolean[] | null
+    }
+    transform_matrix?: number[][] | null
+  } | null>(null)
+  const [fixedImageUrl, setFixedImageUrl] = useState<string | null>(null)
+  const [movingImageUrl, setMovingImageUrl] = useState<string | null>(null)
+  const [matchFilters, setMatchFilters] = useState({
+    minConfidence: 0.0,
+    inliersOnly: false,
+    outliersOnly: false,
+    maxMatches: 500
+  })
   const [showWarpedOverlay, setShowWarpedOverlay] = useState<{ slideId: string; method: string } | null>(null)
   const [warpedOverlayUrl, setWarpedOverlayUrl] = useState<string | null>(null)
   const [warpedOpacity, setWarpedOpacity] = useState(0.5)
   const [warpedLoading, setWarpedLoading] = useState(false)
-  const [selectedMethod, setSelectedMethod] = useState<'simpleitk' | 'tps' | 'affine_tps'>('simpleitk')
+  const [selectedMethod, setSelectedMethod] = useState<'simpleitk' | 'affine_tps'>('simpleitk')
   const [allResults, setAllResults] = useState<Map<string, Map<string, RegistrationResult>>>(new Map())
+  const [showParameterExploration, setShowParameterExploration] = useState<{ slideId: string } | null>(null)
 
   // Load stored registrations for all methods when component mounts or caseId changes
   const loadStoredResults = async () => {
     if (!caseId) return
 
-    const methods: Array<'simpleitk' | 'tps' | 'affine_tps'> = ['simpleitk', 'tps', 'affine_tps']
+    const methods: Array<'simpleitk' | 'affine_tps'> = ['simpleitk', 'affine_tps']
     const resultsByMethod = new Map<string, Map<string, RegistrationResult>>()
 
     for (const method of methods) {
@@ -135,7 +159,7 @@ export function RegistrationResultsViewer({
   // Get available methods (methods that have at least one result)
   const availableMethods = Array.from(allResults.entries())
     .filter(([_, methodMap]) => methodMap.size > 0)
-    .map(([method]) => method as 'simpleitk' | 'tps' | 'affine_tps')
+    .map(([method]) => method as 'simpleitk' | 'affine_tps')
 
   // If selected method has no results, switch to first available method
   useEffect(() => {
@@ -190,24 +214,34 @@ export function RegistrationResultsViewer({
     setShowViz({ slideId, method })
     setVizError(null)
     setVizLoading(true)
-    setVizImageUrl(null) // Clear previous image
+    setMatchData(null)
+    setFixedImageUrl(null)
+    setMovingImageUrl(null)
     
     try {
-      const url = `${API_BASE_URL}/visualization/feature-matches/${fixedSlide.id}/${slideId}?method=${method}&max_matches=100`
-      console.log('Loading visualization from:', url)
+      // Load match data as JSON
+      const dataUrl = `${API_BASE_URL}/visualization/feature-matches-data/${fixedSlide.id}/${slideId}?method=${method}`
+      console.log('Loading match data from:', dataUrl)
       
-      // Test if the URL is accessible
-      const response = await fetch(url)
-      if (!response.ok) {
-        const errorText = await response.text()
-        throw new Error(`Failed to load visualization: ${response.status} ${response.statusText}. ${errorText}`)
+      const dataResponse = await fetch(dataUrl)
+      if (!dataResponse.ok) {
+        const errorText = await dataResponse.text()
+        throw new Error(`Failed to load match data: ${dataResponse.status} ${dataResponse.statusText}. ${errorText}`)
       }
       
-      // Set the URL - loading will continue until image actually loads
-      setVizImageUrl(url)
-      // Don't set loading to false here - let the image onLoad handler do it
+      const data = await dataResponse.json()
+      setMatchData(data)
+      
+      // Load images
+      setFixedImageUrl(getThumbnailUrl(fixedSlide.id, 1024))
+      const movingSlide = slides.find(s => s.id === slideId)
+      if (movingSlide) {
+        setMovingImageUrl(getThumbnailUrl(movingSlide.id, 1024))
+      }
+      
+      setVizLoading(false)
     } catch (error) {
-      console.error('Failed to load feature matches visualization:', error)
+      console.error('Failed to load feature matches:', error)
       setVizError(error instanceof Error ? error.message : 'Failed to load visualization')
       setVizLoading(false)
     }
@@ -263,7 +297,7 @@ export function RegistrationResultsViewer({
         </label>
         <select
           value={selectedMethod}
-          onChange={(e) => setSelectedMethod(e.target.value as 'simpleitk' | 'tps' | 'affine_tps')}
+          onChange={(e) => setSelectedMethod(e.target.value as 'simpleitk' | 'affine_tps')}
           style={{
             padding: '0.4rem 0.6rem',
             fontSize: '0.9rem',
@@ -281,11 +315,8 @@ export function RegistrationResultsViewer({
               {availableMethods.includes('simpleitk') && (
                 <option value="simpleitk">SimpleITK (Rigid/Affine)</option>
               )}
-              {availableMethods.includes('tps') && (
-                <option value="tps">TPS (Non-Rigid, uses LightGlue)</option>
-              )}
               {availableMethods.includes('affine_tps') && (
-                <option value="affine_tps">Affine+TPS (Hybrid)</option>
+                <option value="affine_tps">Affine+TPS (Non-Rigid, uses LightGlue)</option>
               )}
             </>
           )}
@@ -388,30 +419,53 @@ export function RegistrationResultsViewer({
                     Show Warped Overlay
                   </button>
                   {/* Show feature matches button for TPS (uses LightGlue for matching) */}
-                  {(result.method === 'tps' || result.method === 'affine_tps') && (
-                    <button
-                      onClick={() => {
-                        console.log('Button clicked, result.method:', result.method)
-                        showFeatureMatches(slide.id, result.method || 'tps')
-                      }}
-                      style={{
-                        padding: '0.25rem 0.5rem',
-                        fontSize: '0.75rem',
-                        backgroundColor: '#007bff',
-                        color: 'white',
-                        border: 'none',
-                        borderRadius: '4px',
-                        cursor: 'pointer',
-                      }}
-                      onMouseOver={(e) => {
-                        e.currentTarget.style.backgroundColor = '#0056b3'
-                      }}
-                      onMouseOut={(e) => {
-                        e.currentTarget.style.backgroundColor = '#007bff'
-                      }}
-                    >
-                      Show Feature Matches
-                    </button>
+                  {(result.method === 'affine_tps') && (
+                    <>
+                      <button
+                        onClick={() => {
+                          console.log('Button clicked, result.method:', result.method)
+                          showFeatureMatches(slide.id, result.method || 'affine_tps')
+                        }}
+                        style={{
+                          padding: '0.25rem 0.5rem',
+                          fontSize: '0.75rem',
+                          backgroundColor: '#007bff',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                        }}
+                        onMouseOver={(e) => {
+                          e.currentTarget.style.backgroundColor = '#0056b3'
+                        }}
+                        onMouseOut={(e) => {
+                          e.currentTarget.style.backgroundColor = '#007bff'
+                        }}
+                      >
+                        Show Feature Matches
+                      </button>
+                      <button
+                        onClick={() => setShowParameterExploration({ slideId: slide.id })}
+                        style={{
+                          padding: '0.25rem 0.5rem',
+                          fontSize: '0.75rem',
+                          backgroundColor: '#6f42c1',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          marginLeft: '0.25rem',
+                        }}
+                        onMouseOver={(e) => {
+                          e.currentTarget.style.backgroundColor = '#5a32a3'
+                        }}
+                        onMouseOut={(e) => {
+                          e.currentTarget.style.backgroundColor = '#6f42c1'
+                        }}
+                      >
+                        Explore Parameters
+                      </button>
+                    </>
                   )}
                 </div>
                 {/* Debug: Show method if available */}
@@ -576,9 +630,101 @@ export function RegistrationResultsViewer({
             <h3 style={{ marginTop: 0, marginBottom: '1rem' }}>
               Feature Matches ({showViz.method})
             </h3>
-            {vizLoading && !vizImageUrl && (
+            
+            {/* Filter Controls */}
+            <div style={{ 
+              marginBottom: '1rem', 
+              padding: '1rem', 
+              backgroundColor: '#f8f9fa', 
+              borderRadius: '4px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.75rem'
+            }}>
+              <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>Filter Matches:</div>
+              
+              {/* Confidence Filter */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <label style={{ minWidth: '120px', fontSize: '0.9rem' }}>
+                  Min Confidence:
+                </label>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={matchFilters.minConfidence}
+                  onChange={(e) => {
+                    const newVal = parseFloat(e.target.value)
+                    setMatchFilters({ ...matchFilters, minConfidence: newVal })
+                  }}
+                  style={{ flex: 1 }}
+                />
+                <span style={{ minWidth: '50px', textAlign: 'right', fontSize: '0.9rem' }}>
+                  {matchFilters.minConfidence.toFixed(2)}
+                </span>
+              </div>
+              
+              {/* Inliers/Outliers Filter */}
+              <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                <label style={{ minWidth: '120px', fontSize: '0.9rem' }}>Show:</label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="matchType"
+                    checked={!matchFilters.inliersOnly && !matchFilters.outliersOnly}
+                    onChange={() => setMatchFilters({ ...matchFilters, inliersOnly: false, outliersOnly: false })}
+                  />
+                  <span style={{ fontSize: '0.9rem' }}>All</span>
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="matchType"
+                    checked={matchFilters.inliersOnly}
+                    onChange={() => setMatchFilters({ ...matchFilters, inliersOnly: true, outliersOnly: false })}
+                  />
+                  <span style={{ fontSize: '0.9rem', color: '#28a745' }}>Inliers Only (Green)</span>
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}>
+                  <input
+                    type="radio"
+                    name="matchType"
+                    checked={matchFilters.outliersOnly}
+                    onChange={() => setMatchFilters({ ...matchFilters, inliersOnly: false, outliersOnly: true })}
+                  />
+                  <span style={{ fontSize: '0.9rem', color: '#dc3545' }}>Outliers Only (Red)</span>
+                </label>
+              </div>
+              
+              {/* Max Matches */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <label style={{ minWidth: '120px', fontSize: '0.9rem' }}>
+                  Max Matches:
+                </label>
+                <input
+                  type="number"
+                  min="10"
+                  max="500"
+                  step="10"
+                  value={matchFilters.maxMatches}
+                  onChange={(e) => {
+                    const newVal = parseInt(e.target.value) || 100
+                    setMatchFilters({ ...matchFilters, maxMatches: newVal })
+                  }}
+                  style={{ width: '80px', padding: '0.25rem' }}
+                />
+              </div>
+              
+              {/* Note: Filters apply automatically - no refresh needed */}
+              <div style={{ fontSize: '0.85rem', color: '#6c757d', fontStyle: 'italic' }}>
+                Filters apply automatically as you adjust them
+              </div>
+            </div>
+            
+            {vizLoading && (
               <div style={{ padding: '2rem', textAlign: 'center' }}>
-                Loading visualization...
+                Loading match data...
               </div>
             )}
             {vizError && (
@@ -593,38 +739,18 @@ export function RegistrationResultsViewer({
                 </div>
               </div>
             )}
-            {vizImageUrl && !vizError && (
+            {matchData && fixedImageUrl && movingImageUrl && !vizError && (
               <>
-                {vizLoading && (
-                  <div style={{ padding: '2rem', textAlign: 'center', position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }}>
-                    Loading visualization...
-                  </div>
-                )}
-                <img
-                  src={vizImageUrl}
-                  alt="Feature Matches"
-                  style={{
-                    maxWidth: '100%',
-                    height: 'auto',
-                    border: '1px solid #dee2e6',
-                    borderRadius: '4px',
-                    opacity: vizLoading ? 0 : 1,
-                    transition: 'opacity 0.3s',
-                  }}
-                  onLoad={() => {
-                    setVizLoading(false)
-                  }}
-                  onError={() => {
-                    console.error('Image failed to load:', vizImageUrl)
-                    setVizError('Failed to load image. Check console for details.')
-                    setVizLoading(false)
-                  }}
+                <FeatureMatchesCanvas
+                  fixedImageUrl={fixedImageUrl}
+                  movingImageUrl={movingImageUrl}
+                  matchData={matchData.match_data}
+                  transformMatrix={matchData.transform_matrix}
+                  filters={matchFilters}
                 />
-                {!vizLoading && (
-                  <div style={{ marginTop: '0.5rem', fontSize: '0.875rem', color: '#6c757d' }}>
-                    Green lines: inlier matches | Red lines: outlier matches
-                  </div>
-                )}
+                <div style={{ marginTop: '0.5rem', fontSize: '0.875rem', color: '#6c757d' }}>
+                  Solid lines: inlier matches | Dashed lines: outlier matches | Each match pair has a unique color
+                </div>
               </>
             )}
           </div>
@@ -740,6 +866,19 @@ export function RegistrationResultsViewer({
           </div>
         </div>
       )}
+
+      {/* Parameter Exploration Panel */}
+      {showParameterExploration && fixedSlide && (() => {
+        const movingSlideForExploration = slides.find(s => s.id === showParameterExploration!.slideId)
+        if (!movingSlideForExploration) return null
+        return (
+          <ParameterExplorationPanel
+            fixedSlide={fixedSlide}
+            movingSlide={movingSlideForExploration}
+            onClose={() => setShowParameterExploration(null)}
+          />
+        )
+      })()}
     </div>
   )
 }

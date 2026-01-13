@@ -8,7 +8,7 @@ from datetime import datetime
 from app.celery_app import celery_app
 from app.services.registration_service import register_rigid
 from app.services.lightglue_service import register_with_lightglue, LIGHTGLUE_AVAILABLE
-from app.services.tps_service import register_with_tps, register_with_affine_tps, register_with_affine_tps
+from app.services.tps_service import register_with_affine_tps
 from app.services.dsa_client import get_dsa_client
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ def _save_registration_to_dsa(moving_id: str, fixed_id: str, result: dict, metho
         }
         
         # Store method-specific additional fields
-        if method in ["lightglue", "tps", "affine_tps"]:
+        if method in ["lightglue", "affine_tps"]:
             item_meta[reg_key]["num_matches"] = result.get("num_matches", 0)
             item_meta[reg_key]["num_inliers"] = result.get("num_inliers", 0)
             # Store match data for visualization (if available)
@@ -116,7 +116,8 @@ def task_register_rigid(self, *args, **kwargs):
         job_id: Unique job identifier
         fixed_id: DSA item ID of fixed (reference) image
         moving_id: DSA item ID of moving image
-        method: Registration method ('simpleitk', 'lightglue', or 'tps'). Defaults to 'simpleitk'.
+        method: Registration method ('simpleitk' or 'affine_tps'). Defaults to 'simpleitk'.
+        extractor_type: Feature extractor for affine_tps ('superpoint', 'disk', 'aliked', 'sift'). Defaults to 'disk'.
         
     Returns:
         Dictionary with registration results
@@ -129,17 +130,19 @@ def task_register_rigid(self, *args, **kwargs):
             fixed_id = args[1]
             moving_id = args[2]
             method = args[3] if len(args) > 3 else kwargs.get('method', 'simpleitk')
+            extractor_type = kwargs.get('extractor_type', 'disk')
         elif 'job_id' in kwargs:
             # All keyword arguments
             job_id = kwargs['job_id']
             fixed_id = kwargs['fixed_id']
             moving_id = kwargs['moving_id']
             method = kwargs.get('method', 'simpleitk')
+            extractor_type = kwargs.get('extractor_type', 'disk')
         else:
             raise ValueError("Invalid arguments: must provide job_id, fixed_id, moving_id")
         
         # Validate method
-        if method not in ["simpleitk", "tps", "affine_tps"]:
+        if method not in ["simpleitk", "affine_tps"]:
             method = "simpleitk"
         
         logger.info(f"Starting {method} registration task {job_id}: fixed={fixed_id}, moving={moving_id}")
@@ -155,20 +158,21 @@ def task_register_rigid(self, *args, **kwargs):
         )
         
         # Perform registration based on method
-        # Note: LightGlue is only used internally by TPS methods (non-rigid), not as a standalone method
+        # Note: LightGlue is only used internally by affine_tps (non-rigid), not as a standalone method
         # For rigid/affine, use SimpleITK (intensity-based, more appropriate for low DOF)
+        # affine_tps uses LightGlue for matching, then affine (RANSAC) + TPS refinement
         if method == "simpleitk":
             result = register_rigid(fixed_id, moving_id)
-        elif method == "tps":
-            if not LIGHTGLUE_AVAILABLE:
-                raise RuntimeError("LightGlue is not installed. Install with: pip install lightglue")
-            result = register_with_tps(fixed_id, moving_id)
         elif method == "affine_tps":
             if not LIGHTGLUE_AVAILABLE:
                 raise RuntimeError("LightGlue is not installed. Install with: pip install lightglue")
-            result = register_with_affine_tps(fixed_id, moving_id)
+            # Validate extractor_type
+            if extractor_type not in ["superpoint", "disk", "aliked", "sift"]:
+                logger.warning(f"Invalid extractor_type: {extractor_type}, using 'disk'")
+                extractor_type = "disk"
+            result = register_with_affine_tps(fixed_id, moving_id, extractor_type=extractor_type)
         else:
-            raise ValueError(f"Unknown registration method: {method}. Choose 'simpleitk', 'tps', or 'affine_tps'")
+            raise ValueError(f"Unknown registration method: {method}. Choose 'simpleitk' or 'affine_tps'")
         
         # Add job metadata
         result["job_id"] = job_id

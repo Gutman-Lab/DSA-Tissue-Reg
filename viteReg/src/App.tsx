@@ -22,7 +22,7 @@ function App() {
   const [movingSlide, setMovingSlide] = useState<Slide | null>(null)
   const [loading, setLoading] = useState(false)
   const [clearingCache, setClearingCache] = useState(false)
-  const [registrationMethod, setRegistrationMethod] = useState<'simpleitk' | 'tps' | 'affine_tps'>('simpleitk')
+  const [registrationMethod, setRegistrationMethod] = useState<'simpleitk' | 'affine_tps'>('simpleitk')
   const [registrationResults, setRegistrationResults] = useState<Map<string, RegistrationResult>>(new Map())
   const [slidesExpanded, setSlidesExpanded] = useState(true)
 
@@ -272,7 +272,7 @@ function App() {
                         </label>
                         <select
                           value={registrationMethod}
-                          onChange={(e) => setRegistrationMethod(e.target.value as 'simpleitk' | 'tps' | 'affine_tps')}
+                          onChange={(e) => setRegistrationMethod(e.target.value as 'simpleitk' | 'affine_tps')}
                           style={{
                             padding: '0.4rem 0.6rem',
                             fontSize: '0.9rem',
@@ -284,8 +284,7 @@ function App() {
                           }}
                         >
                           <option value="simpleitk">SimpleITK (Rigid/Affine)</option>
-                          <option value="tps">TPS (Non-Rigid, uses LightGlue for matching)</option>
-                          <option value="affine_tps">Affine+TPS (Hybrid: Affine then TPS refinement)</option>
+                          <option value="affine_tps">Affine+TPS (Non-Rigid: Affine pre-alignment + TPS refinement)</option>
                         </select>
                       </div>
                       <RegistrationPanel

@@ -64,8 +64,17 @@ def draw_feature_matches(
     num_matches = min(len(matches), max_matches)
     indices = np.random.choice(len(matches), num_matches, replace=False) if len(matches) > max_matches else np.arange(len(matches))
     
-    # Draw matches
+    # Generate random colors for each match pair (for keypoints)
+    # Use a fixed seed based on match indices for reproducibility
+    np.random.seed(42)
+    match_colors = []
     for idx in indices:
+        # Generate a random color (avoid too dark colors for visibility)
+        color = tuple(np.random.randint(50, 255, size=3).tolist())
+        match_colors.append(color)
+    
+    # Draw matches
+    for i, idx in enumerate(indices):
         match = matches[idx]
         kp0 = keypoints0[match[0]]
         kp1 = keypoints1[match[1]]
@@ -73,20 +82,48 @@ def draw_feature_matches(
         x0, y0 = int(kp0[0]), int(kp0[1])
         x1, y1 = int(kp1[0]) + w0, int(kp1[1])  # Shift x1 to second image
         
-        # Color: green for inliers, red for outliers
+        # Get random color for this match pair (use same color for line and points)
+        point_color = match_colors[i]
+        line_color = point_color
+        
+        # Determine if this is an inlier or outlier
+        is_inlier = False
         if inliers is not None and idx < len(inliers):
-            color = (0, 255, 0) if inliers[idx] else (0, 0, 255)
-            thickness = 2 if inliers[idx] else 1
+            is_inlier = inliers[idx]
+        
+        # Draw line with same color as points
+        # Use dashed line for outliers, solid for inliers
+        if is_inlier:
+            # Solid line for inliers
+            cv2.line(viz, (x0, y0), (x1, y1), line_color, 2, cv2.LINE_AA)
         else:
-            color = (255, 255, 0)  # Yellow for unknown
-            thickness = 1
+            # Dashed line for outliers
+            # Draw dashed line by drawing multiple short segments
+            dx = x1 - x0
+            dy = y1 - y0
+            length = np.sqrt(dx*dx + dy*dy)
+            if length > 0:
+                num_segments = max(8, int(length / 10))  # Adjust dash pattern based on line length
+                for j in range(num_segments):
+                    t0 = j / num_segments
+                    t1 = (j + 0.5) / num_segments  # 50% dash, 50% gap
+                    if t1 > 1.0:
+                        t1 = 1.0
+                    x_start = int(x0 + dx * t0)
+                    y_start = int(y0 + dy * t0)
+                    x_end = int(x0 + dx * t1)
+                    y_end = int(y0 + dy * t1)
+                    cv2.line(viz, (x_start, y_start), (x_end, y_end), line_color, 1, cv2.LINE_AA)
+            else:
+                # Very short line, just draw it solid
+                cv2.line(viz, (x0, y0), (x1, y1), line_color, 1, cv2.LINE_AA)
         
-        # Draw line connecting matches
-        cv2.line(viz, (x0, y0), (x1, y1), color, thickness)
-        
-        # Draw keypoints
-        cv2.circle(viz, (x0, y0), 3, color, -1)
-        cv2.circle(viz, (x1, y1), 3, color, -1)
+        # Draw keypoints with random color for each pair
+        cv2.circle(viz, (x0, y0), 4, point_color, -1)
+        cv2.circle(viz, (x1, y1), 4, point_color, -1)
+        # Add a small border to keypoints for better visibility
+        cv2.circle(viz, (x0, y0), 4, (255, 255, 255), 1)
+        cv2.circle(viz, (x1, y1), 4, (255, 255, 255), 1)
     
     return viz
 
@@ -224,12 +261,91 @@ async def get_warped_overlay(
         )
 
 
+@router.get("/feature-matches-data/{fixed_id}/{moving_id}")
+async def get_feature_matches_data(
+    fixed_id: str,
+    moving_id: str,
+    method: str = Query("affine_tps", description="Registration method to get matches from")
+):
+    """
+    Get feature match data as JSON for client-side rendering
+    
+    Returns match data including keypoints, matches, scores, and inliers.
+    """
+    try:
+        dsa = get_dsa_client()
+        
+        # Get registration result from DSA metadata
+        item_data = dsa.get_item(moving_id)
+        item_meta = item_data.get("meta", {})
+        
+        # Get method-specific registration data
+        reg_key = f"npReg_{method}" if method != "simpleitk" else "npReg"
+        reg_meta = item_meta.get(reg_key) or (item_meta.get("npReg") if method == "simpleitk" else None)
+        
+        if not reg_meta:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No registration data found for method: {method}"
+            )
+        
+        # Get match data from stored metadata
+        match_data = reg_meta.get("match_data")
+        
+        if not match_data and method in ["affine_tps", "lightglue"]:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Match data not available. Please re-run the registration with {method} to generate match data."
+            )
+        
+        if not match_data:
+            raise HTTPException(
+                status_code=404,
+                detail="No match data available for visualization"
+            )
+        
+        # Get transform matrix for affine_tps (to transform keypoints)
+        transform_matrix = None
+        if method == "affine_tps":
+            xfm_key = f"XFM_{method}" if method != "simpleitk" else "XFM"
+            xfm_str = item_meta.get(xfm_key) or (item_meta.get("XFM") if method == "simpleitk" else None)
+            
+            if xfm_str:
+                import json
+                xfm_dict = json.loads(xfm_str) if isinstance(xfm_str, str) else xfm_str
+                transform_matrix = [
+                    xfm_dict.get("0", [1, 0, 0]),
+                    xfm_dict.get("1", [0, 1, 0]),
+                    xfm_dict.get("2", [0, 0, 1])
+                ]
+        
+        return {
+            "fixed_id": fixed_id,
+            "moving_id": moving_id,
+            "method": method,
+            "match_data": match_data,
+            "transform_matrix": transform_matrix,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting feature match data: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get match data: {str(e)}"
+        )
+
+
 @router.get("/feature-matches/{fixed_id}/{moving_id}")
 async def visualize_feature_matches(
     fixed_id: str,
     moving_id: str,
-    method: str = Query("tps", description="Registration method to get matches from (tps uses LightGlue for matching)"),
-    max_matches: int = Query(100, description="Maximum number of matches to display")
+    method: str = Query("affine_tps", description="Registration method to get matches from (affine_tps uses LightGlue for matching)"),
+    max_matches: int = Query(100, description="Maximum number of matches to display"),
+    min_confidence: float = Query(0.0, ge=0.0, le=1.0, description="Minimum match confidence score to display (0.0-1.0)"),
+    inliers_only: bool = Query(False, description="Show only inlier matches (if available)"),
+    outliers_only: bool = Query(False, description="Show only outlier matches (if available)")
 ):
     """
     Visualize feature matches from LightGlue registration
@@ -281,7 +397,7 @@ async def visualize_feature_matches(
         # Get match data from stored metadata
         match_data = reg_meta.get("match_data")
         
-        if not match_data and method in ["tps", "affine_tps", "lightglue"]:  # Support 'tps', 'affine_tps', and legacy 'lightglue' method
+        if not match_data and method in ["affine_tps", "lightglue"]:  # Support 'affine_tps' and legacy 'lightglue' method
             # Check if this is an old registration (before match_data storage was added)
             logger.warning(f"No match_data found for {method} registration on item {moving_id}. Registration may have been run before match_data storage was implemented.")
             raise HTTPException(
@@ -295,6 +411,93 @@ async def visualize_feature_matches(
             keypoints1 = np.array(match_data["keypoints1"])
             matches = np.array(match_data["matches"])
             inliers = np.array(match_data["inliers"]) if match_data.get("inliers") else None
+            match_scores = np.array(match_data["match_scores"]) if match_data.get("match_scores") else None
+            
+            # Apply filters
+            filter_mask = np.ones(len(matches), dtype=bool)
+            
+            # Filter by confidence score
+            if match_scores is not None and min_confidence > 0.0:
+                filter_mask = filter_mask & (match_scores >= min_confidence)
+                logger.debug(f"Filtered by confidence >= {min_confidence}: {np.sum(filter_mask)} matches remain")
+            
+            # Filter by inlier/outlier status
+            if inliers is not None:
+                if inliers_only:
+                    filter_mask = filter_mask & inliers
+                    logger.debug(f"Filtered to inliers only: {np.sum(filter_mask)} matches remain")
+                elif outliers_only:
+                    filter_mask = filter_mask & (~inliers)
+                    logger.debug(f"Filtered to outliers only: {np.sum(filter_mask)} matches remain")
+            
+            # Apply filters
+            matches = matches[filter_mask]
+            if inliers is not None:
+                inliers = inliers[filter_mask]
+            if match_scores is not None:
+                match_scores = match_scores[filter_mask]
+            
+            logger.info(f"Displaying {len(matches)} matches after filtering (from {len(match_data['matches'])})")
+            
+            # For affine_tps, the inliers are based on the affine transform
+            # So we should show matches on the affine-warped moving image for proper visualization
+            if method == "affine_tps":
+                # Get affine transform matrix from metadata
+                xfm_key = f"XFM_{method}" if method != "simpleitk" else "XFM"
+                xfm_str = item_meta.get(xfm_key) or (item_meta.get("XFM") if method == "simpleitk" else None)
+                
+                if xfm_str:
+                    import json
+                    xfm_dict = json.loads(xfm_str) if isinstance(xfm_str, str) else xfm_str
+                    transform_matrix = np.array([
+                        xfm_dict.get("0", [1, 0, 0]),
+                        xfm_dict.get("1", [0, 1, 0]),
+                        xfm_dict.get("2", [0, 0, 1])
+                    ])
+                    
+                    # Extract 2x3 affine matrix
+                    # The stored transform_matrix maps: moving -> fixed
+                    # cv2.warpAffine needs the inverse: fixed -> moving
+                    h, w = fixed_gray.shape[:2]
+                    transform_3x3 = transform_matrix.astype(np.float64)
+                    
+                    # Invert the transform for cv2.warpAffine
+                    try:
+                        det = np.linalg.det(transform_3x3)
+                        if abs(det) < 1e-10:
+                            logger.warning(f"Transform matrix is singular (det={det}), cannot warp for visualization")
+                            # Fall back to original images
+                            moving_gray_warped = moving_gray
+                            keypoints1_warped = keypoints1
+                        else:
+                            transform_inv = np.linalg.inv(transform_3x3)
+                            affine_matrix = transform_inv[:2, :].astype(np.float32)
+                            
+                            # Warp the moving image by the inverse affine transform
+                            moving_gray_warped = cv2.warpAffine(
+                                moving_gray,
+                                affine_matrix,
+                                (w, h),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=0
+                            )
+                            
+                            # Transform moving image keypoints by the inverse affine transform
+                            # keypoints1 are in original moving image coordinates
+                            # We need to transform them to fixed image coordinates (where the warped image is)
+                            ones = np.ones((keypoints1.shape[0], 1), dtype=np.float32)
+                            kpts1_homogeneous = np.concatenate([keypoints1, ones], axis=1)  # (N, 3)
+                            # Use the forward transform (moving->fixed) to transform keypoints
+                            keypoints1_warped = (transform_matrix[:2, :] @ kpts1_homogeneous.T).T  # (N, 2)
+                    except Exception as e:
+                        logger.warning(f"Failed to invert transform for visualization: {e}, using original images")
+                        moving_gray_warped = moving_gray
+                        keypoints1_warped = keypoints1
+                    
+                    # Use the warped moving image and transformed keypoints for visualization
+                    moving_gray = moving_gray_warped
+                    keypoints1 = keypoints1_warped
             
             # Draw matches
             viz_img = draw_feature_matches(
