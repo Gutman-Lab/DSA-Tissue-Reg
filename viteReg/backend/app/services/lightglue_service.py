@@ -28,6 +28,14 @@ def register_with_lightglue(
     thumbnail_width: int = 1024,
     max_keypoints: int = 2048,
     device: Optional[str] = None,
+    # LightGlue extractor parameters
+    detection_threshold: Optional[float] = None,
+    nms_window_size: Optional[int] = None,
+    # LightGlue matcher parameters
+    n_layers: int = 9,
+    depth_confidence: float = 0.9,
+    width_confidence: float = 0.99,
+    filter_threshold: float = 0.1,
     # Note: LightGlue is for rigid transforms only (rotation + translation)
     # For affine transforms, use SimpleITK instead
 ) -> Dict[str, Any]:
@@ -41,6 +49,16 @@ def register_with_lightglue(
         thumbnail_width: Width of thumbnail to use for registration
         max_keypoints: Maximum number of keypoints to extract
         device: Device to use ('cuda' or 'cpu'). Auto-detects if None
+        
+        # LightGlue extractor parameters (for keypoint detection):
+        detection_threshold: Minimum score for keypoint detection (lower = more keypoints, default: extractor default)
+        nms_window_size: Window size for non-maximum suppression (default: extractor default)
+        
+        # LightGlue matcher parameters (for matching):
+        n_layers: Number of attention layers/iterations (default: 9, more = better quality but slower)
+        depth_confidence: Early stopping confidence (0-1, default: 0.9, higher = faster but may miss matches)
+        width_confidence: Point pruning confidence (0-1, default: 0.99, higher = more aggressive pruning)
+        filter_threshold: Filter threshold for matches (0-1, default: 0.1, lower = stricter filtering)
         
     Returns:
         Dictionary with registration results:
@@ -94,8 +112,28 @@ def register_with_lightglue(
             raise ValueError(f"Unknown extractor type: {extractor_type}. Choose from {list(extractor_map.keys())}")
         
         ExtractorClass = extractor_map[extractor_type]
-        extractor = ExtractorClass(max_num_keypoints=max_keypoints).eval().to(device)
-        matcher = LightGlue(features=extractor_type).eval().to(device)
+        
+        # Build extractor with optional parameters
+        extractor_kwargs = {"max_num_keypoints": max_keypoints}
+        if detection_threshold is not None:
+            extractor_kwargs["detection_threshold"] = detection_threshold
+        if nms_window_size is not None:
+            extractor_kwargs["nms_window_size"] = nms_window_size
+        
+        extractor = ExtractorClass(**extractor_kwargs).eval().to(device)
+        
+        # Build matcher with optional parameters
+        matcher_kwargs = {"features": extractor_type}
+        if n_layers is not None:
+            matcher_kwargs["n_layers"] = n_layers
+        if depth_confidence is not None:
+            matcher_kwargs["depth_confidence"] = depth_confidence
+        if width_confidence is not None:
+            matcher_kwargs["width_confidence"] = width_confidence
+        if filter_threshold is not None:
+            matcher_kwargs["filter_threshold"] = filter_threshold
+        
+        matcher = LightGlue(**matcher_kwargs).eval().to(device)
         
         # Extract features
         logger.debug("Extracting features...")

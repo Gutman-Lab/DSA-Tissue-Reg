@@ -10,7 +10,7 @@ services:
     image: redis:7-alpine
     container_name: vite-reg-redis
     ports:
-      - "6379:6379"
+      - "6381:6379"
     networks:
       - vite-reg-network
     volumes:

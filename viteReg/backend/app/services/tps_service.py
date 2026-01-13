@@ -97,7 +97,15 @@ def register_with_tps(
     max_keypoints: int = 2048,
     device: Optional[str] = None,
     smoothing: float = 1.0,
-    min_matches: int = 6
+    min_matches: int = 6,
+    # LightGlue extractor parameters
+    detection_threshold: Optional[float] = None,
+    nms_window_size: Optional[int] = None,
+    # LightGlue matcher parameters
+    n_layers: int = 9,
+    depth_confidence: float = 0.9,
+    width_confidence: float = 0.99,
+    filter_threshold: float = 0.1
 ) -> Dict[str, Any]:
     """
     Perform non-rigid registration using Thin Plate Spline transformation
@@ -114,6 +122,16 @@ def register_with_tps(
         device: Device to use ('cuda' or 'cpu'). Auto-detects if None
         smoothing: TPS smoothing parameter (higher = smoother, less local deformation)
         min_matches: Minimum number of matches required (TPS needs at least 3, but more is better)
+        
+        # LightGlue extractor parameters (for keypoint detection):
+        detection_threshold: Minimum score for keypoint detection (lower = more keypoints, default: extractor default)
+        nms_window_size: Window size for non-maximum suppression (default: extractor default)
+        
+        # LightGlue matcher parameters (for matching):
+        n_layers: Number of attention layers/iterations (default: 9, more = better quality but slower)
+        depth_confidence: Early stopping confidence (0-1, default: 0.9, higher = faster but may miss matches)
+        width_confidence: Point pruning confidence (0-1, default: 0.99, higher = more aggressive pruning)
+        filter_threshold: Filter threshold for matches (0-1, default: 0.1, lower = stricter filtering)
         
     Returns:
         Dictionary with registration results
@@ -162,8 +180,28 @@ def register_with_tps(
             raise ValueError(f"Unknown extractor type: {extractor_type}. Choose from {list(extractor_map.keys())}")
         
         ExtractorClass = extractor_map[extractor_type]
-        extractor = ExtractorClass(max_num_keypoints=max_keypoints).eval().to(device)
-        matcher = LightGlue(features=extractor_type).eval().to(device)
+        
+        # Build extractor with optional parameters
+        extractor_kwargs = {"max_num_keypoints": max_keypoints}
+        if detection_threshold is not None:
+            extractor_kwargs["detection_threshold"] = detection_threshold
+        if nms_window_size is not None:
+            extractor_kwargs["nms_window_size"] = nms_window_size
+        
+        extractor = ExtractorClass(**extractor_kwargs).eval().to(device)
+        
+        # Build matcher with optional parameters
+        matcher_kwargs = {"features": extractor_type}
+        if n_layers is not None:
+            matcher_kwargs["n_layers"] = n_layers
+        if depth_confidence is not None:
+            matcher_kwargs["depth_confidence"] = depth_confidence
+        if width_confidence is not None:
+            matcher_kwargs["width_confidence"] = width_confidence
+        if filter_threshold is not None:
+            matcher_kwargs["filter_threshold"] = filter_threshold
+        
+        matcher = LightGlue(**matcher_kwargs).eval().to(device)
         
         # Extract features
         logger.debug("Extracting features...")
@@ -337,6 +375,14 @@ def register_with_affine_tps(
     affine_max_iters: int = 5000,
     tps_min_inliers: int = 30,
     tps_grid_step: int = 2,
+    # LightGlue extractor parameters
+    detection_threshold: Optional[float] = None,
+    nms_window_size: Optional[int] = None,
+    # LightGlue matcher parameters
+    n_layers: int = 9,
+    depth_confidence: float = 0.9,
+    width_confidence: float = 0.99,
+    filter_threshold: float = 0.1
 ) -> Dict[str, Any]:
     """
     Hybrid registration: LightGlue -> Affine (RANSAC) -> TPS refinement
@@ -361,6 +407,16 @@ def register_with_affine_tps(
         affine_max_iters: Maximum RANSAC iterations for affine estimation
         tps_min_inliers: Minimum inliers required to attempt TPS (otherwise returns affine-only)
         tps_grid_step: Grid step size for TPS warp (smaller = more accurate but slower)
+        
+        # LightGlue extractor parameters (for keypoint detection):
+        detection_threshold: Minimum score for keypoint detection (lower = more keypoints, default: extractor default)
+        nms_window_size: Window size for non-maximum suppression (default: extractor default)
+        
+        # LightGlue matcher parameters (for matching):
+        n_layers: Number of attention layers/iterations (default: 9, more = better quality but slower)
+        depth_confidence: Early stopping confidence (0-1, default: 0.9, higher = faster but may miss matches)
+        width_confidence: Point pruning confidence (0-1, default: 0.99, higher = more aggressive pruning)
+        filter_threshold: Filter threshold for matches (0-1, default: 0.1, lower = stricter filtering)
         
     Returns:
         Dictionary with registration results
@@ -424,8 +480,28 @@ def register_with_affine_tps(
             raise ValueError(f"Unknown extractor type: {extractor_type}. Choose from {list(extractor_map.keys())}")
         
         ExtractorClass = extractor_map[extractor_type]
-        extractor = ExtractorClass(max_num_keypoints=max_keypoints).eval().to(device)
-        matcher = LightGlue(features=extractor_type).eval().to(device)
+        
+        # Build extractor with optional parameters
+        extractor_kwargs = {"max_num_keypoints": max_keypoints}
+        if detection_threshold is not None:
+            extractor_kwargs["detection_threshold"] = detection_threshold
+        if nms_window_size is not None:
+            extractor_kwargs["nms_window_size"] = nms_window_size
+        
+        extractor = ExtractorClass(**extractor_kwargs).eval().to(device)
+        
+        # Build matcher with optional parameters
+        matcher_kwargs = {"features": extractor_type}
+        if n_layers is not None:
+            matcher_kwargs["n_layers"] = n_layers
+        if depth_confidence is not None:
+            matcher_kwargs["depth_confidence"] = depth_confidence
+        if width_confidence is not None:
+            matcher_kwargs["width_confidence"] = width_confidence
+        if filter_threshold is not None:
+            matcher_kwargs["filter_threshold"] = filter_threshold
+        
+        matcher = LightGlue(**matcher_kwargs).eval().to(device)
         
         # Extract features
         logger.debug("Extracting features...")
@@ -535,25 +611,25 @@ def register_with_affine_tps(
             tps = cv2.createThinPlateSplineShapeTransformer()
             tps.estimateTransformation(dst, src, dmatches)
             
-            # Build dense mapping
+            # Use scipy-based TPS warp instead of OpenCV's applyTransformation
+            # OpenCV's applyTransformation has issues with return value format
+            # We'll use the existing apply_tps_warp function which uses scipy
             H, W = out_hw
-            xs = np.arange(0, W, tps_grid_step, dtype=np.float32)
-            ys = np.arange(0, H, tps_grid_step, dtype=np.float32)
-            grid_x, grid_y = np.meshgrid(xs, ys)
-            grid = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 1, 2)
             
-            # Apply TPS transformation
-            _, warped = tps.applyTransformation(grid)
-            warped = warped.reshape(grid_y.shape[0], grid_x.shape[1], 2)
+            # Convert control points to the format expected by apply_tps_warp
+            # p0_aff are points in moving_affine space (source)
+            # p1_in are points in fixed image space (destination)
+            src_points = p0_aff.astype(np.float64)  # (N, 2) - points in moving_affine space
+            dst_points = p1_in.astype(np.float64)    # (N, 2) - points in fixed image space
             
-            # Upsample maps to full resolution
-            map_x_small = warped[..., 0]
-            map_y_small = warped[..., 1]
-            map_x = cv2.resize(map_x_small, (W, H), interpolation=cv2.INTER_LINEAR).astype(np.float32)
-            map_y = cv2.resize(map_y_small, (W, H), interpolation=cv2.INTER_LINEAR).astype(np.float32)
-            
-            # Apply TPS warp
-            moving_tps = cv2.remap(moving_affine, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+            # Apply TPS warp using scipy-based implementation
+            moving_tps = apply_tps_warp(
+                src_img=moving_affine,
+                src_points=src_points,
+                dst_points=dst_points,
+                target_shape=(H, W),
+                smoothing=1.0
+            )
             moving_final = moving_tps
             notes.append(f"Applied TPS refinement with {len(p0_in)} control points")
         

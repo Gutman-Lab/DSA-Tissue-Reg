@@ -75,7 +75,7 @@ def _save_registration_to_dsa(moving_id: str, fixed_id: str, result: dict, metho
         }
         
         # Store method-specific additional fields
-        if method == "lightglue" or method == "tps":
+        if method in ["lightglue", "tps", "affine_tps"]:
             item_meta[reg_key]["num_matches"] = result.get("num_matches", 0)
             item_meta[reg_key]["num_inliers"] = result.get("num_inliers", 0)
             # Store match data for visualization (if available)

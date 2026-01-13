@@ -36,7 +36,7 @@ if [ "$MODE" == "dev" ]; then
     echo "Frontend: http://localhost:5173"
     echo "Backend: http://localhost:8000"
     echo ""
-    docker-compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+    docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 elif [ "$MODE" == "prod" ]; then
     echo "Starting in PRODUCTION mode..."
     echo "Frontend: http://localhost"
