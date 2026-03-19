@@ -178,9 +178,13 @@ async def get_warped_overlay(
             xfm_dict.get("2", [0, 0, 1])
         ])
         
-        # Get thumbnail images
-        fixed_img = get_thumbnail_image(fixed_id, width=width)
-        moving_img = get_thumbnail_image(moving_id, width=width)
+        # Get the thumbnail_width used for registration (if stored)
+        reg_thumbnail_width = reg_meta.get("thumbnail_width", 1024)  # Default to 1024 if not stored
+        
+        # Load images at the registration size to ensure transform alignment
+        # If user requested different size, we'll resize after applying transform
+        fixed_img = get_thumbnail_image(fixed_id, width=reg_thumbnail_width)
+        moving_img = get_thumbnail_image(moving_id, width=reg_thumbnail_width)
         
         if fixed_img is None or moving_img is None:
             raise HTTPException(
@@ -200,12 +204,22 @@ async def get_warped_overlay(
         if moving_img.dtype != np.uint8:
             moving_img = (moving_img * 255).astype(np.uint8) if moving_img.max() <= 1.0 else moving_img.astype(np.uint8)
         
-        # Get dimensions
+        # CRITICAL: Ensure both images have the same dimensions
+        # Even with same width, different aspect ratios can cause different heights
+        # Use fixed image dimensions as reference (transform was calculated for these)
         h, w = fixed_img.shape[:2]
+        h_moving, w_moving = moving_img.shape[:2]
+        
+        if h_moving != h or w_moving != w:
+            logger.info(f"Resizing moving image from {w_moving}x{h_moving} to match fixed image {w}x{h}")
+            moving_img = cv2.resize(moving_img, (w, h), interpolation=cv2.INTER_LINEAR)
         
         # Check if transform is valid (not identity)
         if np.allclose(transform_matrix, np.eye(3), atol=1e-6):
             logger.warning("Transform matrix is identity - registration may not have been applied")
+        
+        # No need to scale transform - we loaded images at registration size
+        # If user requested different size, we'll resize the final result
         
         # Extract 2x3 affine matrix from 3x3 transform matrix
         # The stored transform matrix should map: moving coordinates -> fixed coordinates
@@ -243,6 +257,15 @@ async def get_warped_overlay(
         # Create overlay with opacity
         overlay = cv2.addWeighted(fixed_img, 1.0 - opacity, warped_moving, opacity, 0)
         
+        # Resize to requested width if different from registration size
+        if width != reg_thumbnail_width:
+            # Calculate new height maintaining aspect ratio
+            h_orig, w_orig = overlay.shape[:2]
+            aspect_ratio = h_orig / w_orig
+            new_height = int(width * aspect_ratio)
+            overlay = cv2.resize(overlay, (width, new_height), interpolation=cv2.INTER_LINEAR)
+            logger.info(f"Resized overlay from {w_orig}x{h_orig} to {width}x{new_height}")
+        
         # Encode as PNG
         _, buffer = cv2.imencode('.png', overlay)
         
@@ -258,6 +281,428 @@ async def get_warped_overlay(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to create overlay: {str(e)}"
+        )
+
+
+@router.get("/masks/{fixed_id}/{moving_id}")
+async def visualize_masks(
+    fixed_id: str,
+    moving_id: str,
+    method: str = Query("affine_tps", description="Registration method to get transform from"),
+    width: int = Query(1024, description="Image width for mask visualization")
+):
+    """
+    Visualize the masks used for Dice calculation
+    
+    Returns a side-by-side visualization showing:
+    - Fixed image with its mask overlay
+    - Moving (warped) image with its mask overlay
+    - Both masks side by side
+    - Intersection of the masks
+    """
+    try:
+        from app.services.registration_service import prepare_mask_exit, get_thumbnail_image
+        
+        # Get registration metadata to determine registration size
+        dsa = get_dsa_client()
+        item_data = dsa.get_item(moving_id)
+        item_meta = item_data.get("meta", {})
+        reg_key = f"npReg_{method}" if method != "simpleitk" else "npReg"
+        reg_meta = item_meta.get(reg_key) or (item_meta.get("npReg") if method == "simpleitk" else None)
+        reg_thumbnail_width = reg_meta.get("thumbnail_width", 1024) if reg_meta else 1024
+        
+        # Load images at registration size to ensure transform alignment
+        fixed_img = get_thumbnail_image(fixed_id, width=reg_thumbnail_width)
+        moving_img_original = get_thumbnail_image(moving_id, width=reg_thumbnail_width)
+        
+        if fixed_img is None or moving_img_original is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Failed to retrieve images"
+            )
+        
+        # Convert to RGB if needed
+        if len(fixed_img.shape) == 2:
+            fixed_img = cv2.cvtColor(fixed_img, cv2.COLOR_GRAY2RGB)
+        if len(moving_img_original.shape) == 2:
+            moving_img_original = cv2.cvtColor(moving_img_original, cv2.COLOR_GRAY2RGB)
+        
+        # Ensure uint8
+        if fixed_img.dtype != np.uint8:
+            fixed_img = (fixed_img * 255).astype(np.uint8) if fixed_img.max() <= 1.0 else fixed_img.astype(np.uint8)
+        if moving_img_original.dtype != np.uint8:
+            moving_img_original = (moving_img_original * 255).astype(np.uint8) if moving_img_original.max() <= 1.0 else moving_img_original.astype(np.uint8)
+        
+        # CRITICAL: Ensure both images have the same dimensions
+        # Even with same width, different aspect ratios can cause different heights
+        h_fixed, w_fixed = fixed_img.shape[:2]
+        h_moving, w_moving = moving_img_original.shape[:2]
+        
+        if h_moving != h_fixed or w_moving != w_fixed:
+            logger.info(f"Resizing moving image from {w_moving}x{h_moving} to match fixed image {w_fixed}x{h_fixed}")
+            moving_img_original = cv2.resize(moving_img_original, (w_fixed, h_fixed), interpolation=cv2.INTER_LINEAR)
+        
+        # Start with original moving image - will be warped below
+        moving_img = moving_img_original.copy()
+        
+        # reg_meta already retrieved above
+        
+        if reg_meta:
+            # For affine_tps, we need to regenerate the full warp (affine + TPS) using stored affine matrix and match data
+            if method == "affine_tps":
+                match_data = reg_meta.get("match_data")
+                tps_applied = reg_meta.get("tps_applied", False)  # Check if TPS was actually applied during registration
+                num_inliers = reg_meta.get("num_inliers", 0)  # Number of inliers from registration
+                stored_affine_matrix = reg_meta.get("affine_matrix")  # 2x3 affine matrix from registration
+                
+                # Get stored transform matrix (3x3) as fallback
+                xfm_key = f"XFM_{method}" if method != "simpleitk" else "XFM"
+                xfm_str = item_meta.get(xfm_key) or (item_meta.get("XFM") if method == "simpleitk" else None)
+                
+                if match_data and (stored_affine_matrix is not None or xfm_str is not None):
+                    try:
+                        from app.services.tps_service import apply_tps_warp
+                        import json
+                        
+                        # No need to scale - images already loaded at registration size
+                        scale_factor = 1.0
+                        
+                        # Get the stored affine matrix (prefer 2x3, fallback to 3x3)
+                        if stored_affine_matrix is not None:
+                            # stored_affine_matrix is 2x3: [a00 a01 tx; a10 a11 ty] - maps moving -> fixed
+                            A = np.array(stored_affine_matrix, dtype=np.float64)
+                        elif xfm_str:
+                            # Extract 2x3 from 3x3 transform matrix
+                            xfm_dict = json.loads(xfm_str) if isinstance(xfm_str, str) else xfm_str
+                            transform_matrix = np.array([
+                                xfm_dict.get("0", [1, 0, 0]),
+                                xfm_dict.get("1", [0, 1, 0]),
+                                xfm_dict.get("2", [0, 0, 1])
+                            ], dtype=np.float64)
+                            A = transform_matrix[:2, :]  # Extract 2x3 from 3x3
+                        else:
+                            raise ValueError("No affine matrix found in stored metadata")
+                        
+                        # Scale translation components if image size differs
+                        if scale_factor != 1.0:
+                            A[0, 2] *= scale_factor  # Scale tx
+                            A[1, 2] *= scale_factor  # Scale ty
+                        
+                        # Step 1: Apply affine transform
+                        # A maps moving -> fixed, but cv2.warpAffine needs the inverse
+                        A_3x3 = np.vstack([A, [0, 0, 1]])
+                        A_inv_3x3 = np.linalg.inv(A_3x3)
+                        A_inv = A_inv_3x3[:2, :].astype(np.float32)
+                        
+                        h, w = fixed_img.shape[:2]
+                        moving_affine = cv2.warpAffine(
+                            moving_img,
+                            A_inv,
+                            (w, h),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0
+                        )
+                        
+                        # Step 2: Apply TPS refinement ONLY if it was applied during registration
+                        if tps_applied and num_inliers >= 30 and match_data:
+                            # Get match data for TPS control points
+                            keypoints0 = np.array(match_data["keypoints0"])
+                            keypoints1 = np.array(match_data["keypoints1"])
+                            matches = np.array(match_data["matches"])
+                            inliers = np.array(match_data["inliers"]) if match_data.get("inliers") is not None else None
+                            
+                            if inliers is not None and len(inliers) > 0:
+                                # Scale keypoints if image size differs
+                                if scale_factor != 1.0:
+                                    keypoints0 = keypoints0 * scale_factor
+                                    keypoints1 = keypoints1 * scale_factor
+                                
+                                # Extract inlier matches
+                                inlier_mask = inliers.ravel().astype(bool)
+                                matched_kpts0 = keypoints0[matches[inlier_mask, 0]]  # Fixed image keypoints
+                                matched_kpts1 = keypoints1[matches[inlier_mask, 1]]  # Moving image keypoints
+                                
+                                if len(matched_kpts0) >= 30:
+                                    # Subsample control points if needed (same as registration code)
+                                    max_matches_for_tps = 2000
+                                    p0_in = matched_kpts0.copy()
+                                    p1_in = matched_kpts1.copy()
+                                    
+                                    if len(p0_in) > max_matches_for_tps:
+                                        # Use same deterministic subsampling as registration (seed=0)
+                                        rng = np.random.default_rng(0)
+                                        idx = rng.choice(len(p0_in), size=max_matches_for_tps, replace=False)
+                                        p0_in = p0_in[idx]
+                                        p1_in = p1_in[idx]
+                                        logger.debug(f"Subsampled TPS control points from {len(matched_kpts0)} to {max_matches_for_tps}")
+                                    
+                                    # Transform moving keypoints by affine to get their positions in moving_affine space
+                                    # This matches the registration code exactly
+                                    ones = np.ones((p1_in.shape[0], 1), dtype=np.float32)
+                                    p1_h = np.concatenate([p1_in, ones], axis=1)  # (N,3)
+                                    p1_in_fixed = (A @ p1_h.T).T.astype(np.float64)  # Where p1_in are after affine warp
+                                    
+                                    # TPS maps from moving_affine space to fixed space
+                                    # Source: p1_in_fixed (locations in moving_affine), Dest: p0_in (fixed)
+                                    moving_img = apply_tps_warp(
+                                        src_img=moving_affine,
+                                        src_points=p1_in_fixed,
+                                        dst_points=p0_in.astype(np.float64),
+                                        target_shape=(h, w),
+                                        smoothing=1.0
+                                    )
+                                    logger.debug(f"Applied TPS refinement with {len(p0_in)} control points")
+                                else:
+                                    # Not enough control points, use affine-only
+                                    moving_img = moving_affine
+                                    logger.debug(f"Not enough control points for TPS ({len(matched_kpts0)} < 30), using affine-only")
+                            else:
+                                # No inliers, use affine-only
+                                moving_img = moving_affine
+                                logger.debug("No inliers found, using affine-only")
+                        else:
+                            # TPS was not applied during registration, use affine-only
+                            moving_img = moving_affine
+                            logger.debug(f"Using affine-only (TPS was not applied during registration: tps_applied={tps_applied}, num_inliers={num_inliers})")
+                    except Exception as e:
+                        logger.warning(f"Failed to regenerate affine_tps warp for mask visualization: {e}. Falling back to stored transform matrix.", exc_info=True)
+                        # Fall through to use stored transform matrix below
+                        match_data = None
+                else:
+                    # No match data or affine matrix, fall through to use stored transform matrix
+                    match_data = None
+            
+            # For other methods or if affine_tps regeneration failed, use stored transform matrix
+            if method != "affine_tps" or not match_data:
+                xfm_key = f"XFM_{method}" if method != "simpleitk" else "XFM"
+                xfm_str = item_meta.get(xfm_key) or (item_meta.get("XFM") if method == "simpleitk" else None)
+                
+                if xfm_str:
+                    import json
+                    xfm_dict = json.loads(xfm_str) if isinstance(xfm_str, str) else xfm_str
+                    transform_matrix = np.array([
+                        xfm_dict.get("0", [1, 0, 0]),
+                        xfm_dict.get("1", [0, 1, 0]),
+                        xfm_dict.get("2", [0, 0, 1])
+                    ])
+                    
+                    # No need to scale - images already loaded at registration size
+                    
+                    # Invert transform for warping
+                    transform_3x3 = transform_matrix.astype(np.float64)
+                    det = np.linalg.det(transform_3x3)
+                    if abs(det) > 1e-10:
+                        transform_inv = np.linalg.inv(transform_3x3)
+                        affine_matrix = transform_inv[:2, :].astype(np.float32)
+                        
+                        h, w = fixed_img.shape[:2]
+                        moving_img = cv2.warpAffine(
+                            moving_img,
+                            affine_matrix,
+                            (w, h),
+                            flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                            borderValue=0
+                        )
+                        # Verify warped image size matches expected
+                        h_warped, w_warped = moving_img.shape[:2]
+                        if h_warped != h or w_warped != w:
+                            logger.warning(f"Warped image size mismatch: expected {h}x{w}, got {h_warped}x{w_warped}. Resizing.")
+                            moving_img = cv2.resize(moving_img, (w, h), interpolation=cv2.INTER_LINEAR)
+        
+        # CRITICAL: Ensure images are exactly the same size before mask generation
+        # The warped moving_img should already be the same size as fixed_img, but verify and fix if needed
+        h_fixed, w_fixed = fixed_img.shape[:2]
+        h_moving, w_moving = moving_img.shape[:2]
+        
+        logger.info(f"Image dimensions before final check: fixed={h_fixed}x{w_fixed}, moving={h_moving}x{w_moving}")
+        
+        if h_fixed != h_moving or w_fixed != w_moving:
+            logger.warning(f"Image size mismatch after warping: fixed={h_fixed}x{w_fixed}, moving={h_moving}x{w_moving}. Resizing moving to match fixed.")
+            moving_img = cv2.resize(moving_img, (w_fixed, h_fixed), interpolation=cv2.INTER_LINEAR)
+            logger.info(f"After resize: moving={moving_img.shape[0]}x{moving_img.shape[1]}")
+        
+        # Double-check after resize
+        h_moving, w_moving = moving_img.shape[:2]
+        if h_fixed != h_moving or w_fixed != w_moving:
+            raise ValueError(f"Failed to normalize image sizes: fixed={h_fixed}x{w_fixed}, moving={h_moving}x{w_moving}")
+        
+        # Ensure images are in uint8 format before mask generation
+        if fixed_img.dtype != np.uint8:
+            fixed_img = (fixed_img * 255).astype(np.uint8) if fixed_img.max() <= 1.0 else fixed_img.astype(np.uint8)
+        if moving_img.dtype != np.uint8:
+            moving_img = (moving_img * 255).astype(np.uint8) if moving_img.max() <= 1.0 else moving_img.astype(np.uint8)
+        
+        # Convert to grayscale for mask generation
+        # IMPORTANT: Generate masks on the warped images (both in fixed coordinate space)
+        # moving_img should be the warped version at this point
+        if len(fixed_img.shape) == 3:
+            fixed_gray = cv2.cvtColor(fixed_img, cv2.COLOR_RGB2GRAY)
+        else:
+            fixed_gray = fixed_img.copy()
+            
+        if len(moving_img.shape) == 3:
+            moving_gray = cv2.cvtColor(moving_img, cv2.COLOR_RGB2GRAY)
+        else:
+            moving_gray = moving_img.copy()
+        
+        # Ensure same size (should already be, but double-check)
+        if fixed_gray.shape != moving_gray.shape:
+            moving_gray = cv2.resize(moving_gray, (fixed_gray.shape[1], fixed_gray.shape[0]), interpolation=cv2.INTER_LINEAR)
+            logger.warning(f"Grayscale size mismatch after conversion, resized moving_gray to {fixed_gray.shape}")
+        
+        # Generate masks on the warped images (both in fixed coordinate space)
+        # mask1: fixed image mask (in fixed coordinate space)
+        # mask2: moving image mask (on warped moving image, also in fixed coordinate space)
+        
+        # Check if warped image has content (not all black)
+        moving_nonzero = np.count_nonzero(moving_gray)
+        moving_total = moving_gray.size
+        moving_coverage = (moving_nonzero / moving_total * 100) if moving_total > 0 else 0.0
+        logger.info(f"Warped moving image stats: shape={moving_gray.shape}, dtype={moving_gray.dtype}, "
+                   f"min={moving_gray.min()}, max={moving_gray.max()}, "
+                   f"non-zero pixels={moving_nonzero}/{moving_total} ({moving_coverage:.1f}%)")
+        
+        if moving_coverage < 1.0:
+            logger.warning(f"Warped moving image has very little content ({moving_coverage:.1f}% non-zero). "
+                          f"This might indicate a warping issue or the image is mostly outside the fixed image bounds.")
+        
+        mask1 = prepare_mask_exit(fixed_gray, method="otsu")
+        mask2 = prepare_mask_exit(moving_gray, method="otsu")
+        
+        # Check mask generation results
+        mask1_coverage = (mask1.sum() / (mask1.size * 255) * 100) if mask1.size > 0 else 0.0
+        mask2_coverage = (mask2.sum() / (mask2.size * 255) * 100) if mask2.size > 0 else 0.0
+        
+        logger.info(f"Generated masks: fixed_mask shape={mask1.shape}, coverage={mask1_coverage:.1f}%, "
+                   f"moving_mask shape={mask2.shape}, coverage={mask2_coverage:.1f}%")
+        
+        if mask2_coverage < 0.1:
+            logger.warning(f"Moving mask has very low coverage ({mask2_coverage:.1f}%). "
+                          f"This might indicate the warped image is mostly background or the mask generation failed.")
+        
+        # Convert images to RGB for display (after mask generation)
+        if len(fixed_img.shape) == 2:
+            fixed_img = cv2.cvtColor(fixed_img, cv2.COLOR_GRAY2RGB)
+        if len(moving_img.shape) == 2:
+            moving_img = cv2.cvtColor(moving_img, cv2.COLOR_GRAY2RGB)
+        
+        # Ensure uint8 for display
+        if fixed_img.dtype != np.uint8:
+            fixed_img = (fixed_img * 255).astype(np.uint8) if fixed_img.max() <= 1.0 else fixed_img.astype(np.uint8)
+        if moving_img.dtype != np.uint8:
+            moving_img = (moving_img * 255).astype(np.uint8) if moving_img.max() <= 1.0 else moving_img.astype(np.uint8)
+        
+        # Ensure masks are same size
+        if mask1.shape != mask2.shape:
+            mask2 = cv2.resize(mask2, (mask1.shape[1], mask1.shape[0]), interpolation=cv2.INTER_NEAREST)
+        
+        # Convert to binary
+        mask1_binary = (mask1 > 127).astype(np.uint8)
+        mask2_binary = (mask2 > 127).astype(np.uint8)
+        
+        # Calculate intersection
+        intersection = np.logical_and(mask1_binary, mask2_binary).astype(np.uint8) * 255
+        
+        # CRITICAL: Final size check before creating visualizations
+        h_fixed, w_fixed = fixed_img.shape[:2]
+        h_moving, w_moving = moving_img.shape[:2]
+        if h_fixed != h_moving or w_fixed != w_moving:
+            logger.error(f"Size mismatch before visualization: fixed={h_fixed}x{w_fixed}, moving={h_moving}x{w_moving}")
+            moving_img = cv2.resize(moving_img, (w_fixed, h_fixed), interpolation=cv2.INTER_LINEAR)
+            # Also resize mask2 if needed
+            if mask2.shape != mask1.shape:
+                mask2 = cv2.resize(mask2, (mask1.shape[1], mask1.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mask2_binary = (mask2 > 127).astype(np.uint8)
+        
+        # Create visualizations
+        # 1. Fixed image with mask overlay (green)
+        fixed_with_mask = fixed_img.copy()
+        mask1_colored = np.zeros_like(fixed_img)
+        mask1_colored[mask1_binary > 0] = [0, 255, 0]  # Green overlay
+        fixed_with_mask = cv2.addWeighted(fixed_with_mask, 0.7, mask1_colored, 0.3, 0)
+        
+        # 2. Moving (warped) image with mask overlay (red)
+        moving_with_mask = moving_img.copy()
+        mask2_colored = np.zeros_like(moving_img)
+        mask2_colored[mask2_binary > 0] = [255, 0, 0]  # Red overlay
+        moving_with_mask = cv2.addWeighted(moving_with_mask, 0.7, mask2_colored, 0.3, 0)
+        
+        # Final verification before stacking
+        if fixed_with_mask.shape != moving_with_mask.shape:
+            logger.error(f"Size mismatch in final images: fixed={fixed_with_mask.shape}, moving={moving_with_mask.shape}")
+            moving_with_mask = cv2.resize(moving_with_mask, (fixed_with_mask.shape[1], fixed_with_mask.shape[0]), interpolation=cv2.INTER_LINEAR)
+        
+        # 3. Masks side by side
+        mask1_rgb = cv2.cvtColor(mask1_binary * 255, cv2.COLOR_GRAY2RGB)
+        mask2_rgb = cv2.cvtColor(mask2_binary * 255, cv2.COLOR_GRAY2RGB)
+        masks_side_by_side = np.hstack([mask1_rgb, mask2_rgb])
+        
+        # 4. Intersection
+        intersection_rgb = cv2.cvtColor(intersection, cv2.COLOR_GRAY2RGB)
+        
+        # CRITICAL: Final size check before combining - images MUST be same size for hstack
+        if fixed_with_mask.shape != moving_with_mask.shape:
+            logger.error(f"CRITICAL: Size mismatch before hstack! fixed={fixed_with_mask.shape}, moving={moving_with_mask.shape}")
+            # Force resize to match fixed image
+            h_f, w_f = fixed_with_mask.shape[:2]
+            moving_with_mask = cv2.resize(moving_with_mask, (w_f, h_f), interpolation=cv2.INTER_LINEAR)
+            logger.info(f"Resized moving_with_mask to {moving_with_mask.shape} to match fixed")
+        
+        # Combine all visualizations into a grid
+        # Top row: images with masks
+        top_row = np.hstack([fixed_with_mask, moving_with_mask])
+        # Bottom row: masks and intersection
+        bottom_row = np.hstack([masks_side_by_side, intersection_rgb])
+        
+        # Resize to same width if needed
+        if top_row.shape[1] != bottom_row.shape[1]:
+            target_width = max(top_row.shape[1], bottom_row.shape[1])
+            if top_row.shape[1] < target_width:
+                top_row = cv2.resize(top_row, (target_width, top_row.shape[0]), interpolation=cv2.INTER_LINEAR)
+            if bottom_row.shape[1] < target_width:
+                bottom_row = cv2.resize(bottom_row, (target_width, bottom_row.shape[0]), interpolation=cv2.INTER_LINEAR)
+        
+        # Combine vertically
+        combined = np.vstack([top_row, bottom_row])
+        
+        # Add labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.0
+        thickness = 2
+        color = (255, 255, 255)
+        
+        # Add text labels
+        cv2.putText(combined, "Fixed + Mask", (10, 30), font, font_scale, color, thickness)
+        cv2.putText(combined, "Moving (Warped) + Mask", (top_row.shape[1] // 2 + 10, 30), font, font_scale, color, thickness)
+        cv2.putText(combined, "Fixed Mask | Moving Mask", (10, top_row.shape[0] + 30), font, font_scale, color, thickness)
+        cv2.putText(combined, "Intersection", (top_row.shape[1] // 2 + 10, top_row.shape[0] + 30), font, font_scale, color, thickness)
+        
+        # Resize to requested width if different from registration size
+        if width != reg_thumbnail_width:
+            # Calculate new height maintaining aspect ratio
+            h_orig, w_orig = combined.shape[:2]
+            aspect_ratio = h_orig / w_orig
+            new_height = int(width * aspect_ratio)
+            combined = cv2.resize(combined, (width, new_height), interpolation=cv2.INTER_LINEAR)
+            logger.info(f"Resized masks visualization from {w_orig}x{h_orig} to {width}x{new_height}")
+        
+        # Encode as PNG
+        _, buffer = cv2.imencode('.png', combined)
+        
+        return Response(
+            content=buffer.tobytes(),
+            media_type="image/png"
+        )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating mask visualization: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create mask visualization: {str(e)}"
         )
 
 
@@ -291,6 +736,15 @@ async def get_feature_matches_data(
         
         # Get match data from stored metadata
         match_data = reg_meta.get("match_data")
+        
+        # Handle case where match_data might be stored as JSON string
+        if isinstance(match_data, str):
+            import json
+            try:
+                match_data = json.loads(match_data)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse match_data as JSON for item {moving_id}")
+                match_data = None
         
         if not match_data and method in ["affine_tps", "lightglue"]:
             raise HTTPException(

@@ -1,10 +1,11 @@
 # Use the official lightweight Python image.
 # https://hub.docker.com/_/python
-FROM python:3.11-slim-buster
+# bullseye: Buster is EOL and apt repos return 404
+FROM python:3.11-slim-bullseye
 
 # Copy local code to the container image.
-ENV APP_HOME /app
-ENV PYTHONUNBUFFERED True
+ENV APP_HOME=/app
+ENV PYTHONUNBUFFERED=True
 WORKDIR $APP_HOME
 
 # Install system dependencies

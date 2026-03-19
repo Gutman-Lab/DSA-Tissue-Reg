@@ -65,13 +65,18 @@ export function FeatureMatchesCanvas({
 
   // Draw matches
   useEffect(() => {
-    if (!imagesLoaded || !fixedImg || !movingImg || !canvasRef.current) return
+    if (!imagesLoaded || !fixedImg || !movingImg || !canvasRef.current || !matchData) return
     
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
     const { keypoints0, keypoints1, matches, match_scores, inliers } = matchData
+    
+    if (!keypoints0 || !keypoints1 || !matches || matches.length === 0) {
+      console.warn('Invalid match data:', { keypoints0, keypoints1, matches })
+      return
+    }
     
     // Calculate canvas size
     const h = Math.max(fixedImg.height, movingImg.height)
@@ -116,8 +121,10 @@ export function FeatureMatchesCanvas({
       const indices = Array.from({ length: filteredMatches.length }, (_, i) => i)
       const selected = indices.sort(() => Math.random() - 0.5).slice(0, filters.maxMatches)
       filteredMatches = selected.map(i => filteredMatches[i])
-      filteredInliers = filteredInliers ? selected.map(i => filteredInliers[i]) : undefined
-      filteredScores = filteredScores ? selected.map(i => filteredScores[i]) : undefined
+      const inliers = filteredInliers
+      const scores = filteredScores
+      filteredInliers = inliers ? selected.map((i) => inliers[i]) : undefined
+      filteredScores = scores ? selected.map((i) => scores[i]) : undefined
     }
     
     // Generate random colors for each match pair
@@ -135,18 +142,14 @@ export function FeatureMatchesCanvas({
       const kp1 = keypoints1[match[1]]
       
       // Transform kp1 if transform matrix is provided (for affine_tps)
+      // Note: For affine_tps, the stored transform_matrix is identity (TPS is non-rigid)
+      // So we don't apply it here - the keypoints are shown in their original positions
       let x1 = kp1[0] + fixedImg.width
       let y1 = kp1[1]
       
-      if (transformMatrix) {
-        // Apply transform: [x', y'] = transform_matrix @ [x, y, 1]
-        const x = kp1[0]
-        const y = kp1[1]
-        const xTransformed = transformMatrix[0][0] * x + transformMatrix[0][1] * y + transformMatrix[0][2]
-        const yTransformed = transformMatrix[1][0] * x + transformMatrix[1][1] * y + transformMatrix[1][2]
-        x1 = xTransformed + fixedImg.width
-        y1 = yTransformed
-      }
+      // For now, we don't apply transforms in client-side rendering
+      // The matches are shown in their original positions
+      // TODO: Store and apply the affine transform separately for affine_tps if needed
       
       const x0 = kp0[0]
       const y0 = kp0[1]

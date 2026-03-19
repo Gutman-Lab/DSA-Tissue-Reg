@@ -82,6 +82,24 @@ services:
       - vite-reg-network
     restart: unless-stopped
 
+  # Image Matching WebUI (optional). Start with: docker compose --profile imcui up
+  # If not using the profile, this service is not started and won't spam "exited with code 0 (restarting)"
+  image-matching-webui:
+    image: vincentqin/image-matching-webui:latest
+    container_name: vite-reg-image-matching
+    profiles:
+      - imcui
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./image-matching-data:/app/data
+    networks:
+      - vite-reg-network
+    restart: unless-stopped
+    environment:
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+
 volumes:
   backend-cache:
   redis-data:
@@ -89,4 +107,3 @@ volumes:
 networks:
   vite-reg-network:
     driver: bridge
-

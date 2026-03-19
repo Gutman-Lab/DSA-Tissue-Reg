@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from app.api import cases, registration, images, annotations, visualization
+from app.api import cases, registration, images, annotations, visualization, image_matching_webui
 from app.core.config import settings
 
 
@@ -41,6 +41,7 @@ app.include_router(registration.router, prefix="/api/registration", tags=["regis
 app.include_router(images.router, prefix="/api/images", tags=["images"])
 app.include_router(annotations.router, prefix="/api/annotations", tags=["annotations"])
 app.include_router(visualization.router, prefix="/api/visualization", tags=["visualization"])
+app.include_router(image_matching_webui.router, prefix="/api/image-matching", tags=["image-matching"])
 
 
 @app.get("/")

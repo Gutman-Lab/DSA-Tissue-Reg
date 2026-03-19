@@ -1,5 +1,5 @@
 """Image registration endpoints"""
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Body
 from pydantic import BaseModel
 from typing import List, Optional, Literal, Dict, Any
 import uuid
@@ -613,6 +613,139 @@ async def explore_registration_parameters(
             status_code=500,
             detail=f"Parameter exploration failed: {str(e)}"
         )
+
+
+@router.post("/apply-manual-transform")
+async def apply_manual_transform(
+    fixed_id: str = Body(...),
+    moving_id: str = Body(...),
+    matrix_type: str = Body("Homography"),
+    geom_info: Dict[str, Any] = Body(...),
+    thumbnail_width: int = Body(512)
+):
+    """
+    Apply a manual transformation matrix (from another UI) to images.
+    
+    Request body:
+    {
+        "fixed_id": "6903df8dd26a6d93de19a9b2",
+        "moving_id": "6903df8dd26a6d93de19a9b3",
+        "matrix_type": "Homography",
+        "geom_info": {
+            "Homography": [[...], [...], [...]],
+            ...
+        },
+        "thumbnail_width": 512
+    }
+    """
+    try:
+        import numpy as np
+        import cv2
+        from app.services.registration_service import get_thumbnail_image
+        from app.services.registration_service import (
+            calculate_mutual_information,
+            calculate_normalized_cross_correlation,
+            calculate_structural_similarity
+        )
+        
+        # Load transform matrix
+        if matrix_type not in geom_info:
+            raise ValueError(f"Matrix type '{matrix_type}' not found in geom_info. Available: {list(geom_info.keys())}")
+        
+        transform_matrix = np.array(geom_info[matrix_type])
+        if transform_matrix.shape != (3, 3):
+            raise ValueError(f"Matrix must be 3x3, got shape {transform_matrix.shape}")
+        
+        # Load images
+        fixed_img = get_thumbnail_image(fixed_id, width=thumbnail_width)
+        moving_img = get_thumbnail_image(moving_id, width=thumbnail_width)
+        
+        if fixed_img is None or moving_img is None:
+            raise ValueError("Failed to load images")
+        
+        # Convert to RGB if needed
+        if len(fixed_img.shape) == 2:
+            fixed_img = cv2.cvtColor(fixed_img, cv2.COLOR_GRAY2RGB)
+        elif fixed_img.shape[2] == 4:
+            fixed_img = cv2.cvtColor(fixed_img, cv2.COLOR_RGBA2RGB)
+        
+        if len(moving_img.shape) == 2:
+            moving_img = cv2.cvtColor(moving_img, cv2.COLOR_GRAY2RGB)
+        elif moving_img.shape[2] == 4:
+            moving_img = cv2.cvtColor(moving_img, cv2.COLOR_RGBA2RGB)
+        
+        # Ensure uint8
+        if fixed_img.dtype != np.uint8:
+            fixed_img = (fixed_img * 255).astype(np.uint8) if fixed_img.max() <= 1.0 else fixed_img.astype(np.uint8)
+        if moving_img.dtype != np.uint8:
+            moving_img = (moving_img * 255).astype(np.uint8) if moving_img.max() <= 1.0 else moving_img.astype(np.uint8)
+        
+        h, w = fixed_img.shape[:2]
+        
+        # Apply homography transform
+        # cv2.warpPerspective expects: dst(x,y) = src(H11*x + H12*y + H13, H21*x + H22*y + H23) / (H31*x + H32*y + H33)
+        # This means H maps destination (fixed) coords -> source (moving) coords
+        # The matrix from the other UI likely maps moving->fixed, so we need to invert it
+        transform_3x3 = transform_matrix.astype(np.float64)
+        det = np.linalg.det(transform_3x3)
+        if abs(det) < 1e-10:
+            raise ValueError(f"Transform matrix is singular (det={det:.2e}), cannot invert")
+        
+        # Invert the transform for cv2.warpPerspective (needs fixed->moving, but we have moving->fixed)
+        transform_inv = np.linalg.inv(transform_3x3)
+        
+        moving_registered = cv2.warpPerspective(
+            moving_img,
+            transform_inv,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+        
+        # Calculate metrics
+        fixed_gray = cv2.cvtColor(fixed_img, cv2.COLOR_RGB2GRAY) if len(fixed_img.shape) == 3 else fixed_img
+        moving_gray_reg = cv2.cvtColor(moving_registered, cv2.COLOR_RGB2GRAY) if len(moving_registered.shape) == 3 else moving_registered
+        
+        mi_score = calculate_mutual_information(fixed_gray, moving_gray_reg)
+        ncc_score = calculate_normalized_cross_correlation(fixed_gray, moving_gray_reg)
+        ssim_score = calculate_structural_similarity(fixed_gray, moving_gray_reg)
+        
+        # Extract transform parameters
+        if abs(transform_matrix[2, 0]) < 1e-6 and abs(transform_matrix[2, 1]) < 1e-6:
+            rotation_rad = np.arctan2(transform_matrix[1, 0], transform_matrix[0, 0])
+            rotation_degrees = float(np.degrees(rotation_rad))
+            scale_x = np.sqrt(transform_matrix[0, 0]**2 + transform_matrix[0, 1]**2)
+            scale_y = np.sqrt(transform_matrix[1, 0]**2 + transform_matrix[1, 1]**2)
+            scale = float((scale_x + scale_y) / 2.0)
+            offset_x = float(transform_matrix[0, 2])
+            offset_y = float(transform_matrix[1, 2])
+        else:
+            rotation_degrees = None
+            scale = None
+            offset_x = float(transform_matrix[0, 2] / transform_matrix[2, 2])
+            offset_y = float(transform_matrix[1, 2] / transform_matrix[2, 2])
+        
+        # Convert to 3x3 list for return
+        transform_matrix_list = transform_matrix.tolist()
+        
+        return {
+            "transform_matrix": transform_matrix_list,
+            "rotation_degrees": rotation_degrees,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "scale": scale if scale is not None else 1.0,
+            "mutual_information": float(mi_score) if mi_score is not None else 0.0,
+            "normalized_cross_correlation": float(ncc_score) if ncc_score is not None else None,
+            "structural_similarity": float(ssim_score) if ssim_score is not None else None,
+            "success": True,
+            "method": "manual_transform",
+            "matrix_type": matrix_type,
+        }
+        
+    except Exception as e:
+        logger.error(f"Manual transform failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/clear-cache")

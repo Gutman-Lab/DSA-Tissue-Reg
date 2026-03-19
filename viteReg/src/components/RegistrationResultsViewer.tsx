@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { getThumbnailUrl } from '../services/images'
 import { getSlideInfo } from '../services/cases'
 import { loadStoredRegistrations } from '../services/registration'
@@ -25,7 +25,7 @@ export function RegistrationResultsViewer({
   const [opacities, setOpacities] = useState<Map<string, number>>(new Map())
   const [slideCache, setSlideCache] = useState<Map<string, Slide>>(new Map())
   const [showViz, setShowViz] = useState<{ slideId: string; method: string } | null>(null)
-  const [vizImageUrl, setVizImageUrl] = useState<string | null>(null)
+  const [, setVizImageUrl] = useState<string | null>(null)
   const [vizError, setVizError] = useState<string | null>(null)
   const [vizLoading, setVizLoading] = useState(false)
   const [matchData, setMatchData] = useState<{
@@ -58,7 +58,7 @@ export function RegistrationResultsViewer({
   const [showParameterExploration, setShowParameterExploration] = useState<{ slideId: string } | null>(null)
 
   // Load stored registrations for all methods when component mounts or caseId changes
-  const loadStoredResults = async () => {
+  const loadStoredResults = useCallback(async () => {
     if (!caseId) return
 
     const methods: Array<'simpleitk' | 'affine_tps'> = ['simpleitk', 'affine_tps']
@@ -79,11 +79,11 @@ export function RegistrationResultsViewer({
     }
 
     setAllResults(resultsByMethod)
-  }
+  }, [caseId])  // Only depend on caseId to avoid constant re-fetching
 
   useEffect(() => {
     loadStoredResults()
-  }, [caseId])
+  }, [loadStoredResults])
 
   // Merge current registrationResults into allResults
   // Also reload from DSA when new registrations complete (they should be saved to DSA)
@@ -230,6 +230,13 @@ export function RegistrationResultsViewer({
       }
       
       const data = await dataResponse.json()
+      console.log('Loaded match data:', { 
+        numMatches: data.match_data?.matches?.length,
+        hasKeypoints0: !!data.match_data?.keypoints0,
+        hasKeypoints1: !!data.match_data?.keypoints1,
+        hasInliers: !!data.match_data?.inliers,
+        hasScores: !!data.match_data?.match_scores,
+      })
       setMatchData(data)
       
       // Load images
@@ -237,6 +244,8 @@ export function RegistrationResultsViewer({
       const movingSlide = slides.find(s => s.id === slideId)
       if (movingSlide) {
         setMovingImageUrl(getThumbnailUrl(movingSlide.id, 1024))
+      } else {
+        throw new Error(`Moving slide not found: ${slideId}`)
       }
       
       setVizLoading(false)

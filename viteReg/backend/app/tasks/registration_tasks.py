@@ -66,6 +66,7 @@ def _save_registration_to_dsa(moving_id: str, fixed_id: str, result: dict, metho
             "scale": result.get("scale", 1.0),
             "rotation": result.get("rotation_degrees", 0.0),
             "regImageSize": result.get("reg_image_size", 1024),
+            "thumbnail_width": result.get("thumbnail_width", 1024),  # Store the image size used for registration
             "preRotate": result.get("pre_rotate", "None"),
             "mutual_information": result.get("mutual_information", 0.0),
             "dice_coefficient": result.get("dice_coefficient"),
@@ -83,6 +84,21 @@ def _save_registration_to_dsa(moving_id: str, fixed_id: str, result: dict, metho
                 # Store match data as JSON (it's already a dict with lists)
                 import json
                 item_meta[reg_key]["match_data"] = result.get("match_data")
+        
+        # Store TPS-specific fields for affine_tps method
+        if method == "affine_tps":
+            # Store the 2x3 affine matrix (separate from the full 3x3 transform_matrix)
+            affine_matrix = result.get("affine_matrix")
+            if affine_matrix:
+                item_meta[reg_key]["affine_matrix"] = affine_matrix
+            
+            # Store whether TPS was actually applied (important for visualization/regeneration)
+            item_meta[reg_key]["tps_applied"] = result.get("tps_applied", False)
+            
+            # Store registration notes (useful for debugging)
+            notes = result.get("notes")
+            if notes:
+                item_meta[reg_key]["notes"] = notes
         
         # Store transform matrix as JSON string (XFM_{method})
         transform_matrix = result.get("transform_matrix")

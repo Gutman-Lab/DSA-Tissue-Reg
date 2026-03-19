@@ -27,6 +27,13 @@ except ImportError:
     SCIPY_AVAILABLE = False
     logger.warning("scipy not available. Install with: pip install scipy")
 
+try:
+    from sklearn.neighbors import NearestNeighbors
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    logger.warning("sklearn not available. Spatial consistency filtering will be disabled. Install with: pip install scikit-learn")
+
 
 def _filter_spatial_consistency(
     points0: np.ndarray,
@@ -49,7 +56,10 @@ def _filter_spatial_consistency(
     Returns:
         Boolean array indicating which matches pass spatial consistency check
     """
-    from sklearn.neighbors import NearestNeighbors
+    if not SKLEARN_AVAILABLE:
+        # sklearn not available, skip spatial filtering
+        logger.debug("sklearn not available, skipping spatial consistency filtering")
+        return np.ones(len(points0), dtype=bool)
     
     if len(points0) < k_neighbors + 1:
         # Not enough points to check spatial consistency
@@ -95,10 +105,6 @@ def _filter_spatial_consistency(
                 valid[i] = False
         
         return valid
-    except ImportError:
-        # sklearn not available, skip spatial filtering
-        logger.warning("sklearn not available, skipping spatial consistency filtering")
-        return np.ones(len(points0), dtype=bool)
     except Exception as e:
         logger.warning(f"Spatial consistency filtering failed: {e}, using all matches")
         return np.ones(len(points0), dtype=bool)
@@ -598,28 +604,31 @@ def register_with_affine_tps(
         m = matches01["matches"]  # Shape: (K, 2)
         match_confidence = matches01.get('matching_scores', None)
         
+        logger.info(f"LightGlue found {len(m)} initial matches")
+        if match_confidence is not None:
+            logger.info(f"Match confidence range: [{match_confidence.min().item():.3f}, {match_confidence.max().item():.3f}], mean: {match_confidence.mean().item():.3f}")
+        
         if m.numel() == 0:
             raise ValueError("No matches returned by LightGlue")
         
         # Filter matches by confidence if available
-        # This helps remove poor quality matches that can cause bad registration
+        # LightGlue confidence scores are typically in [0, 1], with good matches often > 0.1
+        # We use a lower threshold to keep more matches, letting RANSAC filter outliers
         if match_confidence is not None:
-            confidence_threshold = 0.2  # Stricter threshold for better quality matches
+            # Start with a lenient threshold - RANSAC will handle outlier rejection
+            confidence_threshold = 0.05  # Lower threshold to keep more matches
             valid_matches = match_confidence > confidence_threshold
-            m = m[valid_matches]
-            match_confidence = match_confidence[valid_matches]
-            logger.info(f"Filtered matches by confidence: {len(m)} matches above threshold {confidence_threshold} (from {len(matches01['matches'])})")
+            m_filtered = m[valid_matches]
+            match_confidence_filtered = match_confidence[valid_matches]
             
-            if len(m) < 3:
-                logger.warning(f"After confidence filtering, only {len(m)} matches remain. Lowering threshold to 0.1...")
-                confidence_threshold = 0.1
-                m = matches01["matches"]
-                match_confidence = matches01.get('matching_scores', None)
-                if match_confidence is not None:
-                    valid_matches = match_confidence > confidence_threshold
-                    m = m[valid_matches]
-                    match_confidence = match_confidence[valid_matches]
-                    logger.info(f"After lowering threshold: {len(m)} matches")
+            # Only use filtered matches if we still have enough
+            if len(m_filtered) >= 10:  # Need enough for RANSAC to work well
+                m = m_filtered
+                match_confidence = match_confidence_filtered
+                logger.info(f"Filtered matches by confidence: {len(m)} matches above threshold {confidence_threshold} (from {len(matches01['matches'])})")
+            else:
+                logger.info(f"Confidence filtering left only {len(m_filtered)} matches, using all {len(m)} matches (RANSAC will filter outliers)")
+                # Keep all matches, let RANSAC do the filtering
         
         if len(m) < 3:
             raise ValueError(f"Not enough matches after filtering: {len(m)}. Need at least 3 for affine transform.")
@@ -639,22 +648,37 @@ def register_with_affine_tps(
         # Optional: Filter matches by spatial consistency (topographic constraint)
         # Remove matches where nearby points in one image match to far-away points in the other
         # This helps enforce that local spatial relationships are preserved
-        if len(p0) > 10:  # Only do this if we have enough matches
-            spatial_consistent = _filter_spatial_consistency(p0, p1, max_neighbor_distance_ratio=2.0)
-            p0 = p0[spatial_consistent]
-            p1 = p1[spatial_consistent]
-            m = m[spatial_consistent]
-            logger.info(f"After spatial consistency filtering: {len(p0)} matches remain")
+        # Only apply if we have many matches - it can be too aggressive for challenging cases
+        if len(p0) > 50:  # Only do this if we have plenty of matches
+            spatial_consistent = _filter_spatial_consistency(p0, p1, max_neighbor_distance_ratio=3.0)  # More lenient ratio
+            if np.sum(spatial_consistent) >= 20:  # Only use if we keep enough matches
+                p0 = p0[spatial_consistent]
+                p1 = p1[spatial_consistent]
+                m = m[spatial_consistent]
+                logger.info(f"After spatial consistency filtering: {len(p0)} matches remain")
+            else:
+                logger.info(f"Spatial consistency filtering too aggressive ({np.sum(spatial_consistent)} matches), skipping")
         
         # Step 2: Coarse affine with RANSAC
         # cv2.estimateAffine2D(src, dst) estimates transform: src -> dst
         # We want: moving (p1) -> fixed (p0)
         # So we call: estimateAffine2D(p1, p0) to get moving->fixed transform
+        
+        # Scale RANSAC threshold with image size (threshold is in pixels)
+        # For smaller images, use proportionally smaller threshold
+        # Base threshold of 3px works well for 1024px images
+        image_size_factor = thumbnail_width / 1024.0
+        scaled_ransac_thresh = affine_ransac_thresh_px * image_size_factor
+        # But don't go below 1px or above 10px
+        scaled_ransac_thresh = max(1.0, min(10.0, scaled_ransac_thresh))
+        
+        logger.info(f"RANSAC threshold: {scaled_ransac_thresh:.2f}px (scaled from {affine_ransac_thresh_px}px for {thumbnail_width}px images)")
+        
         A, inliers = cv2.estimateAffine2D(
             p1,  # Source: moving image keypoints
             p0,  # Destination: fixed image keypoints
             method=cv2.RANSAC,
-            ransacReprojThreshold=float(affine_ransac_thresh_px),
+            ransacReprojThreshold=float(scaled_ransac_thresh),
             maxIters=int(affine_max_iters),
             confidence=0.999,
             refineIters=10,
@@ -770,6 +794,21 @@ def register_with_affine_tps(
         fixed_gray = cv2.cvtColor(fixed_rgb, cv2.COLOR_RGB2GRAY) if len(fixed_rgb.shape) == 3 else fixed_rgb
         moving_gray = cv2.cvtColor(moving_final_rgb, cv2.COLOR_RGB2GRAY) if len(moving_final_rgb.shape) == 3 else moving_final_rgb
         
+        # Ensure images are in uint8 format [0, 255] for mask generation
+        # fixed_rgb and moving_final_rgb are in [0, 1] range from torch, so convert
+        if fixed_gray.dtype != np.uint8:
+            if fixed_gray.max() <= 1.0:
+                fixed_gray = (np.clip(fixed_gray, 0, 1) * 255).astype(np.uint8)
+            else:
+                fixed_gray = np.clip(fixed_gray, 0, 255).astype(np.uint8)
+        if moving_gray.dtype != np.uint8:
+            if moving_gray.max() <= 1.0:
+                moving_gray = (np.clip(moving_gray, 0, 1) * 255).astype(np.uint8)
+            else:
+                moving_gray = np.clip(moving_gray, 0, 255).astype(np.uint8)
+        
+        logger.debug(f"Image stats for Dice: fixed shape={fixed_gray.shape}, dtype={fixed_gray.dtype}, range=[{fixed_gray.min()}, {fixed_gray.max()}], moving shape={moving_gray.shape}, dtype={moving_gray.dtype}, range=[{moving_gray.min()}, {moving_gray.max()}]")
+        
         # Calculate metrics
         from app.services.registration_service import (
             calculate_mutual_information,
@@ -780,34 +819,111 @@ def register_with_affine_tps(
             find_relative_rotation
         )
         
-        mi_score = calculate_mutual_information(fixed_gray, moving_gray)
-        ncc_score = calculate_normalized_cross_correlation(fixed_gray, moving_gray)
-        ssim_score = calculate_structural_similarity(fixed_gray, moving_gray)
+        # Ensure images are same size for metrics
+        h_fixed, w_fixed = fixed_gray.shape[:2]
+        h_moving, w_moving = moving_gray.shape[:2]
+        if h_fixed != h_moving or w_fixed != w_moving:
+            logger.warning(f"Image size mismatch for metrics: fixed={h_fixed}x{w_fixed}, moving={h_moving}x{w_moving}. Resizing moving to match fixed.")
+            moving_gray = cv2.resize(moving_gray, (w_fixed, h_fixed), interpolation=cv2.INTER_LINEAR)
+        
+        mi_score = None
+        ncc_score = None
+        ssim_score = None
+        dice = None
+        
+        try:
+            mi_score = calculate_mutual_information(fixed_gray, moving_gray)
+            logger.debug(f"MI score: {mi_score}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate MI: {e}", exc_info=True)
+        
+        try:
+            ncc_score = calculate_normalized_cross_correlation(fixed_gray, moving_gray)
+            logger.debug(f"NCC score: {ncc_score}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate NCC: {e}", exc_info=True)
+        
+        try:
+            ssim_score = calculate_structural_similarity(fixed_gray, moving_gray)
+            logger.debug(f"SSIM score: {ssim_score}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate SSIM: {e}", exc_info=True)
         
         # Calculate Dice on masks
         # Note: For registered images, we don't need to test rotations - they should already be aligned
         # Different stains may produce different mask shapes even with good registration,
         # so Dice might be lower than expected for different stain types
-        mask1 = prepare_mask_exit(fixed_gray, method="otsu")
-        mask2 = prepare_mask_exit(moving_gray, method="otsu")
-        
-        # Ensure masks are same size (they should be after registration, but check anyway)
-        h1, w1 = mask1.shape
-        h2, w2 = mask2.shape
-        if h1 != h2 or w1 != w2:
-            # Resize mask2 to match mask1
-            mask2 = cv2.resize(mask2, (w1, h1), interpolation=cv2.INTER_NEAREST)
-        
-        # Convert to binary for Dice calculation
-        mask1_binary = (mask1 > 0).astype(np.uint8)
-        mask2_binary = (mask2 > 0).astype(np.uint8)
-        
-        # Calculate Dice directly (no rotation testing needed - images are already registered)
-        intersection = np.logical_and(mask1_binary, mask2_binary).sum()
-        size1 = mask1_binary.sum()
-        size2 = mask2_binary.sum()
-        dice = 2.0 * intersection / (size1 + size2) if (size1 + size2) > 0 else 0.0
-        dice = min(1.0, max(0.0, dice))  # Clamp to [0, 1]
+        try:
+            # Images should already be uint8 from above, but double-check
+            mask1 = prepare_mask_exit(fixed_gray, method="otsu")
+            mask2 = prepare_mask_exit(moving_gray, method="otsu")
+            
+            # Ensure masks are same size (they should be after registration, but check anyway)
+            h1, w1 = mask1.shape
+            h2, w2 = mask2.shape
+            if h1 != h2 or w1 != w2:
+                logger.warning(f"Mask size mismatch: fixed={h1}x{w1}, moving={h2}x{w2}. Resizing moving mask.")
+                mask2 = cv2.resize(mask2, (w1, h1), interpolation=cv2.INTER_NEAREST)
+            
+            # Convert to binary for Dice calculation
+            # prepare_mask_exit returns masks where tissue=255, background=0
+            mask1_binary = (mask1 > 127).astype(np.uint8)  # Use 127 as threshold (middle of 0-255)
+            mask2_binary = (mask2 > 127).astype(np.uint8)
+            
+            # Log mask statistics for debugging
+            mask1_pct = (mask1_binary.sum() / mask1_binary.size) * 100 if mask1_binary.size > 0 else 0
+            mask2_pct = (mask2_binary.sum() / mask2_binary.size) * 100 if mask2_binary.size > 0 else 0
+            logger.info(f"Mask stats: fixed={mask1_pct:.1f}% tissue ({mask1_binary.sum()} pixels), moving={mask2_pct:.1f}% tissue ({mask2_binary.sum()} pixels), total={mask1_binary.size} pixels")
+            
+            # Calculate Dice directly (no rotation testing needed - images are already registered)
+            intersection = np.logical_and(mask1_binary, mask2_binary).sum()
+            size1 = mask1_binary.sum()
+            size2 = mask2_binary.sum()
+            
+            logger.info(f"Dice calculation: intersection={intersection}, size1={size1}, size2={size2}, total_pixels={mask1_binary.size}")
+            
+            if (size1 + size2) == 0:
+                logger.warning("Both masks are empty - cannot calculate Dice")
+                dice = 0.0
+            else:
+                dice = 2.0 * intersection / (size1 + size2)
+                dice = min(1.0, max(0.0, dice))  # Clamp to [0, 1]
+            
+            logger.info(f"Dice score: {dice:.4f} (intersection={intersection}, union={size1 + size2}, formula=2*{intersection}/({size1}+{size2}))")
+            
+            # Also calculate overlap percentage for debugging
+            overlap_pct = (intersection / mask1_binary.size) * 100 if mask1_binary.size > 0 else 0.0
+            logger.info(f"Overlap: {overlap_pct:.1f}% of image area ({intersection}/{mask1_binary.size} pixels)")
+            
+            # If Dice is suspiciously low, try alternative: use a more lenient threshold
+            # This helps when Otsu finds very different thresholds for different stains
+            if dice < 0.1 and size1 > 0 and size2 > 0:
+                logger.warning(f"Dice is very low ({dice:.4f}). Trying alternative mask generation with fixed threshold...")
+                # Try using a fixed threshold based on image intensity percentiles
+                # This is more robust to different stain intensities
+                fixed_thresh1 = np.percentile(fixed_gray, 50)  # Median intensity
+                fixed_thresh2 = np.percentile(moving_gray, 50)
+                # Use the lower threshold to be more inclusive
+                combined_thresh = min(fixed_thresh1, fixed_thresh2)
+                
+                alt_mask1 = (fixed_gray < combined_thresh).astype(np.uint8)  # Darker = tissue
+                alt_mask2 = (moving_gray < combined_thresh).astype(np.uint8)
+                
+                alt_intersection = np.logical_and(alt_mask1, alt_mask2).sum()
+                alt_size1 = alt_mask1.sum()
+                alt_size2 = alt_mask2.sum()
+                
+                if (alt_size1 + alt_size2) > 0:
+                    alt_dice = 2.0 * alt_intersection / (alt_size1 + alt_size2)
+                    logger.info(f"Alternative Dice (fixed threshold {combined_thresh:.1f}): {alt_dice:.4f} (intersection={alt_intersection}, sizes={alt_size1}, {alt_size2})")
+                    # Use the higher Dice score
+                    if alt_dice > dice:
+                        dice = alt_dice
+                        logger.info(f"Using alternative Dice score: {dice:.4f}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate Dice: {e}", exc_info=True)
+            dice = None
         
         # Store match data for visualization
         # Note: Store ALL original matches (before confidence filtering) for visualization
@@ -838,12 +954,65 @@ def register_with_affine_tps(
             "confidence_passed": confidence_passed,  # Additional info: which matches passed confidence filtering
         }
         
+        # Generate warped overlay thumbnail for visualization (base64 encoded)
+        warped_overlay_base64 = None
+        try:
+            import base64
+            # Use the already-aligned images for overlay
+            # fixed_rgb and moving_final_rgb should be the same size after registration
+            h_fo, w_fo = fixed_rgb.shape[:2]
+            h_mo, w_mo = moving_final_rgb.shape[:2]
+            
+            # Ensure same size (they should be, but check)
+            if h_fo != h_mo or w_fo != w_mo:
+                moving_overlay = cv2.resize(moving_final_rgb, (w_fo, h_fo), interpolation=cv2.INTER_LINEAR)
+            else:
+                moving_overlay = moving_final_rgb.copy()
+            
+            fixed_overlay = fixed_rgb.copy()
+            
+            # Convert to uint8 if needed (images should already be in [0, 1] range from torch)
+            if fixed_overlay.dtype != np.uint8:
+                if fixed_overlay.max() <= 1.0:
+                    fixed_overlay = (np.clip(fixed_overlay, 0, 1) * 255).astype(np.uint8)
+                else:
+                    fixed_overlay = np.clip(fixed_overlay, 0, 255).astype(np.uint8)
+            if moving_overlay.dtype != np.uint8:
+                if moving_overlay.max() <= 1.0:
+                    moving_overlay = (np.clip(moving_overlay, 0, 1) * 255).astype(np.uint8)
+                else:
+                    moving_overlay = np.clip(moving_overlay, 0, 255).astype(np.uint8)
+            
+            # Resize overlay to match thumbnail_width (but cap at reasonable size for JSON response)
+            # Use thumbnail_width as the target, but don't exceed 1024px to keep response size manageable
+            target_size = min(thumbnail_width, 1024)
+            max_dim = max(w_fo, h_fo)
+            if max_dim > target_size:
+                scale = target_size / max_dim
+                new_w = int(w_fo * scale)
+                new_h = int(h_fo * scale)
+                fixed_overlay = cv2.resize(fixed_overlay, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                moving_overlay = cv2.resize(moving_overlay, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                logger.debug(f"Resized overlay from {w_fo}x{h_fo} to {new_w}x{new_h} (target: {target_size}px, thumbnail_width: {thumbnail_width}px)")
+            
+            # Create overlay with 50% opacity
+            overlay = cv2.addWeighted(fixed_overlay, 0.5, moving_overlay, 0.5, 0)
+            
+            # Encode as PNG base64
+            success, buffer = cv2.imencode('.png', overlay)
+            if success:
+                warped_overlay_base64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
+                logger.debug(f"Generated warped overlay thumbnail ({overlay.shape[1]}x{overlay.shape[0]})")
+        except Exception as e:
+            logger.warning(f"Failed to generate warped overlay thumbnail: {e}", exc_info=True)
+        
         return {
             "transform_matrix": [[float(x) for x in row] for row in A_3x3.tolist()],
             "rotation_degrees": rotation_degrees,
             "offset_x": offset_x,
             "offset_y": offset_y,
             "scale": scale,
+            "thumbnail_width": thumbnail_width,  # Store the image size used for registration
             "mutual_information": float(mi_score) if mi_score is not None else 0.0,
             "normalized_cross_correlation": float(ncc_score) if ncc_score is not None else None,
             "structural_similarity": float(ssim_score) if ssim_score is not None else None,
@@ -854,6 +1023,7 @@ def register_with_affine_tps(
             "affine_matrix": [[float(x) for x in row] for row in A.tolist()],
             "tps_applied": moving_tps is not None,
             "notes": notes,
+            "warped_overlay_base64": warped_overlay_base64,  # Base64-encoded PNG thumbnail
             "success": True,
         }
         

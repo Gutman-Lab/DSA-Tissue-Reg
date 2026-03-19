@@ -32,3 +32,6 @@ dist-ssr
 # Docker
 .dockerignore
 .npCacheDir/**
+
+# Image matching webui data
+image-matching-data/**

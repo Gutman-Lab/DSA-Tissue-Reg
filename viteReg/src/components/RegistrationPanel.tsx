@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { autoRegisterCase, getRegistrationStatus, loadStoredRegistrations, type RegistrationResult } from '../services/registration'
 import { getSlideInfo } from '../services/cases'
 import type { Slide } from '../types'
@@ -97,45 +97,45 @@ export function RegistrationPanel({
     }
   }
 
-  const [loadingStored, setLoadingStored] = useState(false)
+  // Use useRef to store the latest onRegistrationStatusUpdate to avoid dependency issues
+  const onStatusUpdateRef = useRef(onRegistrationStatusUpdate)
+  useEffect(() => {
+    onStatusUpdateRef.current = onRegistrationStatusUpdate
+  }, [onRegistrationStatusUpdate])
 
-  const handleLoadStored = useCallback(async () => {
+  // Auto-load stored registrations when caseId, fixedSlide, or method changes
+  // Stored registrations are automatically loaded - no manual button needed
+  useEffect(() => {
     if (!caseId || !fixedSlide) {
       return
     }
 
-    setLoadingStored(true)
-    try {
-      console.log('Loading stored registrations for case:', caseId, 'method:', registrationMethod)
-      const storedResults = await loadStoredRegistrations(caseId, registrationMethod)
-      console.log('Loaded stored registrations:', storedResults)
-      
-      // Convert stored results to RegistrationResult format and notify parent
-      storedResults.forEach((result) => {
-        if (onRegistrationStatusUpdate) {
-          onRegistrationStatusUpdate(result)
+    const loadStored = async () => {
+      try {
+        console.log('Auto-loading stored registrations for case:', caseId, 'method:', registrationMethod)
+        const storedResults = await loadStoredRegistrations(caseId, registrationMethod)
+        console.log('Auto-loaded stored registrations:', storedResults)
+        
+        // Convert stored results to RegistrationResult format and notify parent
+        storedResults.forEach((result) => {
+          if (onStatusUpdateRef.current) {
+            onStatusUpdateRef.current(result)
+          }
+        })
+        
+        if (storedResults.length === 0) {
+          console.log(`No stored registrations found for method: ${registrationMethod}`)
+        } else {
+          console.log(`Auto-loaded ${storedResults.length} stored registration(s)`)
         }
-      })
-      
-      if (storedResults.length === 0) {
-        console.log(`No stored registrations found for method: ${registrationMethod}`)
-      } else {
-        console.log(`Loaded ${storedResults.length} stored registration(s)`)
+      } catch (error) {
+        console.error('Failed to auto-load stored registrations:', error)
+        // Errors are logged to console, no popup needed
       }
-    } catch (error) {
-      console.error('Failed to load stored registrations:', error)
-      // Errors are logged to console, no popup needed
-    } finally {
-      setLoadingStored(false)
     }
-  }, [caseId, fixedSlide, registrationMethod, onRegistrationStatusUpdate])
 
-  // Auto-load stored registrations when caseId, fixedSlide, or method changes
-  useEffect(() => {
-    if (caseId && fixedSlide) {
-      handleLoadStored()
-    }
-  }, [caseId, fixedSlide?.id, registrationMethod, handleLoadStored])
+    loadStored()
+  }, [caseId, fixedSlide?.id, registrationMethod])  // Auto-load when these change
 
   const allComplete = jobIds.length === 0 && results.size > 0
   const hasFailures = Array.from(results.values()).some((r) => r.status === 'failed')
@@ -166,33 +166,6 @@ export function RegistrationPanel({
           Registration
         </h3>
         <div style={{ display: 'flex', gap: '0.5rem' }}>
-          <button
-            onClick={handleLoadStored}
-            disabled={loadingStored || !caseId || !fixedSlide}
-            style={{
-              padding: '0.5rem 1rem',
-              fontSize: '0.875rem',
-              fontWeight: 500,
-              color: '#ffffff',
-              backgroundColor: loadingStored || !caseId || !fixedSlide ? '#95a5a6' : '#27ae60',
-              border: 'none',
-              borderRadius: '6px',
-              cursor: loadingStored || !caseId || !fixedSlide ? 'not-allowed' : 'pointer',
-              transition: 'background-color 0.2s ease',
-            }}
-            onMouseEnter={(e) => {
-              if (!loadingStored && caseId && fixedSlide) {
-                e.currentTarget.style.backgroundColor = '#229954'
-              }
-            }}
-            onMouseLeave={(e) => {
-              if (!loadingStored && caseId && fixedSlide) {
-                e.currentTarget.style.backgroundColor = '#27ae60'
-              }
-            }}
-          >
-            {loadingStored ? 'Loading...' : 'Load Stored'}
-          </button>
           <button
             onClick={handleAutoRegister}
             disabled={registering || !caseId || !fixedSlide}

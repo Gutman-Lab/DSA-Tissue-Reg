@@ -1,55 +1,113 @@
 """
-Registration service using SimpleITK for rigid image registration
+Image registration service using SimpleITK
+Provides rigid registration functionality and utility functions
 """
 import numpy as np
 import cv2
 import SimpleITK as sitk
 import logging
 import requests
-import os
 from io import BytesIO
 from PIL import Image
 from typing import Dict, Any, Tuple, Optional
-from joblib import Memory
+import skimage
+from skimage import filters
 from app.services.dsa_client import get_dsa_client
-from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Initialize joblib Memory cache for numpy arrays
-# Cache directory is persistent within Docker container
-cache_dir = settings.CACHE_DIR
-os.makedirs(cache_dir, exist_ok=True)
-memory = Memory(cache_dir, verbose=0)
-
-
-@memory.cache
-def _fetch_thumbnail_uncached(item_id: str, width: int, token: str) -> Optional[np.ndarray]:
-    """Internal cached function to fetch thumbnail (token is part of cache key)"""
-    base_url = settings.DSA_BASE_URL.rstrip('/api/v1')
-    url = f"{base_url}/api/v1/item/{item_id}/tiles/thumbnail?width={width}"
-    if token:
-        url += f"&token={token}"
+# Simple memory cache decorator (can be replaced with joblib.Memory if needed)
+class SimpleCache:
+    """Simple in-memory cache for function results"""
+    def __init__(self):
+        self.cache = {}
     
+    def cache_decorator(self, func):
+        def wrapper(*args, **kwargs):
+            # Create cache key from args and kwargs
+            key = str(args) + str(sorted(kwargs.items()))
+            if key not in self.cache:
+                self.cache[key] = func(*args, **kwargs)
+            return self.cache[key]
+        return wrapper
+
+memory = SimpleCache()
+
+
+def get_thumbnail_image(item_id: str, width: int = 1024) -> np.ndarray:
+    """
+    Fetch thumbnail image from DSA and return as numpy array
+    
+    Args:
+        item_id: DSA item ID
+        width: Thumbnail width in pixels
+        
+    Returns:
+        Image as numpy array (RGB, uint8)
+    """
     try:
-        response = requests.get(url, timeout=30)
+        dsa = get_dsa_client()
+        url = dsa.get_thumbnail_url(item_id, width=width)
+        
+        response = requests.get(url)
         response.raise_for_status()
+        
         img = Image.open(BytesIO(response.content))
-        return np.array(img)
+        img_np = np.array(img)
+        
+        # Convert to RGB if image is in RGBA format
+        if len(img_np.shape) == 3 and img_np.shape[2] == 4:
+            img = img.convert("RGB")
+            img_np = np.array(img)
+        
+        return img_np
     except Exception as e:
-        logger.error(f"Failed to get thumbnail for {item_id}: {e}")
-        return None
+        logger.error(f"Error fetching thumbnail for item {item_id}: {e}")
+        raise
 
 
-def get_thumbnail_image(item_id: str, width: int = 1024) -> Optional[np.ndarray]:
-    """Fetch thumbnail image from DSA and return as numpy array (cached)"""
-    dsa = get_dsa_client()
-    token = dsa.get_token() or ""
-    return _fetch_thumbnail_uncached(item_id, width, token)
+def prepare_mask_exit(image: np.ndarray, method: str = "threshold") -> np.ndarray:
+    """
+    Create a mask based on image processing
+    
+    Args:
+        image: Input image (grayscale or RGB)
+        method: Method to use ('threshold' or 'otsu')
+        
+    Returns:
+        Binary mask (True for tissue, False for background)
+    """
+    # If image is already grayscale, use it directly
+    if len(image.shape) == 2:
+        gray_image = image
+    else:
+        # Convert RGB to grayscale
+        gray_image = skimage.color.rgb2gray(image)
+    
+    if method == "otsu":
+        # Use Otsu's method for thresholding
+        threshold = filters.threshold_otsu(gray_image)
+        mask = gray_image < threshold
+    else:
+        # Original method: gaussian filter + threshold
+        blurred_image = filters.gaussian(gray_image, sigma=1.0)
+        threshold = 0.95
+        mask = blurred_image < threshold
+    
+    return mask
 
 
 def pad_to_size(mask: np.ndarray, target_size: int) -> np.ndarray:
-    """Pad a mask to a target square size, centering it"""
+    """
+    Pad a mask to a target square size, centering it
+    
+    Args:
+        mask: Input mask
+        target_size: Target size (square)
+        
+    Returns:
+        Padded mask
+    """
     h, w = mask.shape
     pad_height = target_size - h
     pad_width = target_size - w
@@ -58,225 +116,175 @@ def pad_to_size(mask: np.ndarray, target_size: int) -> np.ndarray:
     pad_left = pad_width // 2
     pad_right = pad_width - pad_left
     
-    return np.pad(mask, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant', constant_values=0)
+    padded_mask = np.pad(
+        mask,
+        ((pad_top, pad_bottom), (pad_left, pad_right)),
+        mode="constant",
+        constant_values=False,
+    )
+    return padded_mask
+
+
+def dice_coefficient(mask1: np.ndarray, mask2: np.ndarray) -> float:
+    """
+    Calculate Dice coefficient between two masks
+    
+    Args:
+        mask1: First binary mask
+        mask2: Second binary mask
+        
+    Returns:
+        Dice coefficient (0-1)
+    """
+    intersection = np.sum(mask1 & mask2)
+    size1 = np.sum(mask1)
+    size2 = np.sum(mask2)
+    if size1 + size2 == 0:
+        return 1.0
+    return 2 * intersection / (size1 + size2)
 
 
 def find_relative_rotation(padded_mask1: np.ndarray, padded_mask2: np.ndarray) -> Tuple[int, float]:
     """
-    Find relative rotation between two masks by testing 0, 90, 180, 270 degrees
-    
-    Uses Dice coefficient: 2 * |A ∩ B| / (|A| + |B|)
-    where |A| is the number of non-zero pixels in mask A
-    """
-    best_k = 0
-    max_dice = 0
-    
-    # Convert masks to binary (0 or 1) for proper Dice calculation
-    mask1_binary = (padded_mask1 > 0).astype(np.uint8)
-    mask2_binary = (padded_mask2 > 0).astype(np.uint8)
-    
-    for k in range(4):
-        rotated_mask2 = np.rot90(mask2_binary, k)
-        
-        # Calculate intersection and individual mask sizes
-        intersection = np.logical_and(mask1_binary, rotated_mask2).sum()
-        size1 = mask1_binary.sum()
-        size2 = rotated_mask2.sum()
-        
-        # Dice coefficient: 2 * intersection / (size1 + size2)
-        # This ensures Dice is always between 0 and 1
-        dice = 2.0 * intersection / (size1 + size2) if (size1 + size2) > 0 else 0.0
-        
-        # Clamp to [0, 1] to handle any edge cases
-        dice = min(1.0, max(0.0, dice))
-        
-        if dice > max_dice:
-            max_dice = dice
-            best_k = k
-    
-    return best_k * 90, max_dice
-
-
-def prepare_mask_exit(image: np.ndarray, method: str = "otsu") -> np.ndarray:
-    """
-    Prepare a binary mask from an image using Gaussian blur and thresholding
+    Find the relative rotation between two masks by testing 0°, 90°, 180°, 270°
     
     Args:
-        image: Input image (grayscale or RGB)
-        method: Thresholding method - "otsu" (adaptive) or "fixed" (0.95 threshold)
-    
+        padded_mask1: First mask
+        padded_mask2: Second mask
+        
     Returns:
-        Binary mask (255 for tissue, 0 for background)
+        Tuple of (rotation_angle_degrees, dice_coefficient)
     """
-    # Normalize to 0-1 if needed
-    if image.max() > 1.0:
-        image = image.astype(np.float32) / 255.0
+    max_dice = 0
+    best_k = 0
+    first_dice = 0
     
-    # Convert to grayscale if RGB
-    if len(image.shape) == 3:
-        image = cv2.cvtColor((image * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    for k in range(4):  # 0°, 90°, 180°, 270°
+        rotated_mask2 = np.rot90(padded_mask2, k)
+        dice = dice_coefficient(padded_mask1, rotated_mask2)
+        
+        if k == 0:
+            first_dice = dice
+        
+        if dice > max_dice:
+            if dice > (first_dice + 0.005):
+                best_k = k
+            max_dice = dice
     
-    # Apply Gaussian blur to reduce noise
-    blurred = cv2.GaussianBlur((image * 255).astype(np.uint8), (5, 5), 1.0)
-    
-    if method == "otsu":
-        # Use OTSU's method for adaptive thresholding
-        # OTSU automatically finds the optimal threshold that minimizes intra-class variance
-        threshold_value, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        # Invert so that tissue is white (255) and background is black (0)
-        # THRESH_BINARY_INV already inverts, so tissue (darker) becomes white
-        logger.debug(f"OTSU threshold: {threshold_value:.1f}")
-    else:
-        # Fixed threshold at 0.95 (original method)
-        # Assumes background is very bright (>0.95) and tissue is darker
-        threshold = int(0.95 * 255)
-        _, mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
-        logger.debug(f"Fixed threshold: {threshold} (0.95)")
-    
-    return mask
+    return best_k * 90, max_dice  # Rotation angle and similarity score
 
 
-def calculate_mutual_information(img1: np.ndarray, img2: np.ndarray, bins: int = 50) -> float:
-    """Calculate mutual information between two images"""
-    # Ensure images are same size
-    if img1.shape != img2.shape:
-        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-    
-    # Flatten images
-    img1_flat = img1.flatten()
-    img2_flat = img2.flatten()
-    
-    # Calculate 2D histogram
-    hist_2d, _, _ = np.histogram2d(img1_flat, img2_flat, bins=bins)
-    
-    # Convert to probabilities
-    pxy = hist_2d / float(np.sum(hist_2d))
-    px = np.sum(pxy, axis=1)  # marginal for x
-    py = np.sum(pxy, axis=0)  # marginal for y
-    
-    # Calculate mutual information
-    px_py = px[:, None] * py[None, :]
-    nzs = pxy > 0  # Only include non-zero elements
-    
-    mi = np.sum(pxy[nzs] * np.log(pxy[nzs] / px_py[nzs]))
-    return float(mi)
-
-
-def calculate_normalized_cross_correlation(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Calculate normalized cross-correlation between two images (better for different stains)"""
-    # Ensure images are same size
-    if img1.shape != img2.shape:
-        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-    
-    # Normalize images
-    img1_norm = (img1 - img1.mean()) / (img1.std() + 1e-10)
-    img2_norm = (img2 - img2.mean()) / (img2.std() + 1e-10)
-    
-    # Calculate cross-correlation
-    ncc = (img1_norm * img2_norm).mean()
-    return float(ncc)
-
-
-def calculate_structural_similarity(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Calculate Structural Similarity Index (SSIM) - focuses on structural features"""
-    # Ensure images are same size
-    if img1.shape != img2.shape:
-        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
-    
-    # Normalize to 0-1 if needed
-    if img1.max() > 1.0:
-        img1 = img1.astype(np.float32) / 255.0
-    if img2.max() > 1.0:
-        img2 = img2.astype(np.float32) / 255.0
-    
-    # Constants for SSIM
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
-    
-    # Calculate means
-    mu1 = img1.mean()
-    mu2 = img2.mean()
-    
-    # Calculate variances and covariance
-    sigma1_sq = ((img1 - mu1) ** 2).mean()
-    sigma2_sq = ((img2 - mu2) ** 2).mean()
-    sigma12 = ((img1 - mu1) * (img2 - mu2)).mean()
-    
-    # Calculate SSIM
-    numerator = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
-    denominator = (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
-    
-    ssim = numerator / (denominator + 1e-10)
-    return float(ssim)
-
-
-@memory.cache
-def _register_rigid_cached(
-    fixed_id: str,
-    moving_id: str,
-    fixed_img_hash: str,
-    moving_img_hash: str,
-    thumbnail_width: int = 1024
-) -> Dict[str, Any]:
+def metrics_registration(affine_matrix: np.ndarray) -> Tuple[float, float, float, float]:
     """
-    Internal cached registration function.
-    Image hashes are used to invalidate cache when images change.
-    This caches the expensive SimpleITK registration computation.
+    Extract registration metrics from affine transformation matrix
+    
+    Args:
+        affine_matrix: 3x3 affine transformation matrix
+        
+    Returns:
+        Tuple of (rotation_degrees, offset_x, offset_y, scaling)
+    """
+    a, b, t_x = affine_matrix[0, 0], affine_matrix[0, 1], affine_matrix[0, 2]
+    c, d, t_y = affine_matrix[1, 0], affine_matrix[1, 1], affine_matrix[1, 2]
+    
+    rotation_degrees = np.arctan2(c, a) * 180 / np.pi
+    offset_x = t_x
+    offset_y = t_y
+    scaling = np.sqrt(a * d - b * c)
+    
+    return rotation_degrees, offset_x, offset_y, scaling
+
+
+def register_rigid(fixed_id: str, moving_id: str, thumbnail_width: int = 1024) -> Dict[str, Any]:
+    """
+    Perform rigid registration using SimpleITK
+    
+    Uses Similarity2DTransform (rigid + uniform scaling) with mutual information metric
+    
+    Args:
+        fixed_id: DSA item ID of fixed (reference) image
+        moving_id: DSA item ID of moving image
+        thumbnail_width: Width of thumbnail to use for registration
+        
+    Returns:
+        Dictionary with registration results:
+        - success: Whether registration succeeded
+        - transform_matrix: 3x3 affine transformation matrix
+        - rotation_degrees: Rotation in degrees
+        - offset_x: X translation
+        - offset_y: Y translation
+        - scale: Scale factor
+        - mutual_information: Mutual information metric value
+        - reg_image_size: Size of image used for registration
+        - thumbnail_width: Width of thumbnail used
     """
     try:
-        # Get thumbnail images (these are already cached separately)
-        fixed_img = get_thumbnail_image(fixed_id, width=thumbnail_width)
-        moving_img = get_thumbnail_image(moving_id, width=thumbnail_width)
+        logger.info(f"Starting rigid registration: fixed={fixed_id}, moving={moving_id}")
         
-        if fixed_img is None or moving_img is None:
-            raise ValueError("Failed to retrieve thumbnail images")
+        # Get thumbnail images
+        fixed_img_sk = get_thumbnail_image(fixed_id, width=thumbnail_width)
+        moving_img_sk = get_thumbnail_image(moving_id, width=thumbnail_width)
         
         # Convert grayscale to RGB if needed
-        if len(fixed_img.shape) == 2:
-            fixed_img = np.stack([fixed_img] * 3, axis=-1)
-        if len(moving_img.shape) == 2:
-            moving_img = np.stack([moving_img] * 3, axis=-1)
+        if len(fixed_img_sk.shape) == 2:
+            fixed_img_sk = np.stack([fixed_img_sk] * 3, axis=-1)
+        if len(moving_img_sk.shape) == 2:
+            moving_img_sk = np.stack([moving_img_sk] * 3, axis=-1)
         
-        # Create grayscale copies for registration
-        fixed_gray = cv2.cvtColor(fixed_img, cv2.COLOR_RGB2GRAY)
-        moving_gray = cv2.cvtColor(moving_img, cv2.COLOR_RGB2GRAY)
+        # CRITICAL: Normalize image sizes - ensure both have same dimensions
+        # Even with same width, different aspect ratios can cause different heights
+        h_fixed, w_fixed = fixed_img_sk.shape[:2]
+        h_moving, w_moving = moving_img_sk.shape[:2]
+        
+        if h_moving != h_fixed or w_moving != w_fixed:
+            logger.info(f"Normalizing image sizes: fixed={w_fixed}x{h_fixed}, moving={w_moving}x{h_moving}")
+            # Resize moving image to match fixed image dimensions
+            moving_img_sk = cv2.resize(moving_img_sk, (w_fixed, h_fixed), interpolation=cv2.INTER_LINEAR)
+            logger.info(f"Resized moving image to {w_fixed}x{h_fixed} to match fixed image")
+        
+        # Create grayscale copies for registration while preserving original color
+        fixed_gray = cv2.cvtColor(fixed_img_sk, cv2.COLOR_RGB2GRAY)
+        moving_gray = cv2.cvtColor(moving_img_sk, cv2.COLOR_RGB2GRAY)
         
         # Convert to float32 for SimpleITK
         fixed_gray = fixed_gray.astype(np.float32) / 255.0
         moving_gray = moving_gray.astype(np.float32) / 255.0
         
-        # Prepare masks and find relative rotation (using OTSU for adaptive thresholding)
-        mask1 = prepare_mask_exit(fixed_gray, method="otsu")
-        mask2 = prepare_mask_exit(moving_gray, method="otsu")
+        # Load and process both images for mask creation
+        mask = prepare_mask_exit(fixed_gray)
+        mask2 = prepare_mask_exit(moving_gray)
         
-        # Pad masks to same size
-        h1, w1 = mask1.shape
+        # Determine the maximum dimension and pad both masks
+        h1, w1 = mask.shape
         h2, w2 = mask2.shape
         max_dim = max(h1, w1, h2, w2)
-        padded_mask1 = pad_to_size(mask1, max_dim)
+        padded_mask1 = pad_to_size(mask, max_dim)
         padded_mask2 = pad_to_size(mask2, max_dim)
         
-        # Find relative rotation
+        # Determine the orientation
         relative_rotation, dice = find_relative_rotation(padded_mask1, padded_mask2)
-        logger.info(f"Relative rotation: {relative_rotation}°, Dice: {dice:.3f}")
+        
+        logger.debug(f"Relative rotation: {relative_rotation} degrees, Dice: {dice:.3f}")
         
         # Rotate moving image if needed
         if relative_rotation != 0:
-            moving_gray = np.rot90(moving_gray, int(relative_rotation / 90))
-            moving_img = np.rot90(moving_img, int(relative_rotation / 90))
+            moving_image_rgb = np.rot90(moving_img_sk, int(relative_rotation / 90))
+            moving_gray_rotated = np.rot90(moving_gray, int(relative_rotation / 90))
+        else:
+            moving_image_rgb = moving_img_sk
+            moving_gray_rotated = moving_gray
         
-        # Convert to SimpleITK format
-        fixed_sitk = sitk.GetImageFromArray(fixed_gray)
-        moving_sitk = sitk.GetImageFromArray(moving_gray)
+        # Convert to SimpleITK format - use grayscale for registration
+        fixed_img = sitk.GetImageFromArray(fixed_gray)
+        moving_img = sitk.GetImageFromArray(moving_gray_rotated)
         
-        # Define rigid transform (rotation + translation only, no scaling)
-        # For tissue slides, we assume same physical size, so scaling can cause poor registrations
-        transform = sitk.Euler2DTransform()
+        # Define a similarity transform
+        transform = sitk.Similarity2DTransform()
         
         # Initialize transform by aligning centers
         initial_transform = sitk.CenteredTransformInitializer(
-            fixed_sitk,
-            moving_sitk,
+            fixed_img,
+            moving_img,
             transform,
             sitk.CenteredTransformInitializerFilter.GEOMETRY,
         )
@@ -309,143 +317,171 @@ def _register_rigid_cached(
         registration_method.SetSmoothingSigmasPerLevel([2, 1, 0])
         
         # Execute registration
-        logger.info("Executing registration...")
-        final_transform = registration_method.Execute(fixed_sitk, moving_sitk)
+        final_transform = registration_method.Execute(fixed_img, moving_img)
         
-        # Extract parameters (Euler2DTransform: angle, tx, ty - no scale)
+        # Extract parameters from the final transform
         parameters = final_transform.GetParameters()
-        angle = parameters[0]
-        tx = parameters[1]
-        ty = parameters[2]
+        scale = parameters[0]
+        angle = parameters[1]
+        tx = parameters[2]
+        ty = parameters[3]
         
-        # Construct affine matrix (rigid transform: rotation + translation, scale = 1.0)
+        # Construct the affine matrix
         cos_theta = np.cos(angle)
         sin_theta = np.sin(angle)
         
-        affine_matrix = np.array([
-            [cos_theta, -sin_theta, tx],
-            [sin_theta, cos_theta, ty],
-            [0, 0, 1],
-        ])
+        # Similarity transform matrix
+        affine_matrix = np.array(
+            [
+                [scale * cos_theta, -scale * sin_theta, tx],
+                [scale * sin_theta, scale * cos_theta, ty],
+                [0, 0, 1],
+            ]
+        )
         
-        # Calculate metrics
-        rotation_degrees = np.degrees(angle)
-        offset_x = float(tx)
-        offset_y = float(ty)
-        scaling = 1.0  # Rigid transform has no scaling
+        # Extract metrics
+        rotation_degrees, offset_x, offset_y, scaling = metrics_registration(affine_matrix)
         
-        # Apply transform to moving image and calculate MI
-        resampler = sitk.ResampleImageFilter()
-        resampler.SetReferenceImage(fixed_sitk)
-        resampler.SetTransform(final_transform)
-        resampler.SetInterpolator(sitk.sitkLinear)
-        resampler.SetDefaultPixelValue(0)
-        registered_sitk = resampler.Execute(moving_sitk)
-        registered_img = sitk.GetArrayFromImage(registered_sitk)
+        # Get mutual information value (if available)
+        try:
+            mutual_information = registration_method.GetMetricValue()
+        except:
+            mutual_information = 0.0
         
-        # Calculate multiple metrics for different stain types
-        mi_score = calculate_mutual_information(fixed_gray, registered_img)
-        ncc_score = calculate_normalized_cross_correlation(fixed_gray, registered_img)
-        ssim_score = calculate_structural_similarity(fixed_gray, registered_img)
+        # Get image size
+        reg_image_size = max(fixed_img_sk.shape[0], fixed_img_sk.shape[1])
         
-        logger.info(f"Registration complete: rotation={rotation_degrees:.2f}°, "
-                   f"offset=({offset_x:.2f}, {offset_y:.2f}), scale={scaling:.4f}, "
-                   f"MI={mi_score:.4f}, NCC={ncc_score:.4f}, SSIM={ssim_score:.4f}, Dice={dice:.4f}")
-        
-        return {
-            "transform_matrix": affine_matrix.tolist(),
-            "rotation_degrees": rotation_degrees,
-            "offset_x": offset_x,
-            "offset_y": offset_y,
-            "scale": scaling,
-            "mutual_information": mi_score,
-            "normalized_cross_correlation": ncc_score,
-            "structural_similarity": ssim_score,
+        result = {
             "success": True,
+            "transform_matrix": affine_matrix.tolist(),
+            "rotation_degrees": float(rotation_degrees),
+            "offset_x": float(offset_x),
+            "offset_y": float(offset_y),
+            "scale": float(scaling),
+            "mutual_information": float(mutual_information),
+            "reg_image_size": int(reg_image_size),
+            "thumbnail_width": int(thumbnail_width),
+            "pre_rotate": str(relative_rotation) if relative_rotation != 0 else "None",
             "relative_rotation": int(relative_rotation),
-            "dice_coefficient": float(dice),
-            "reg_image_size": thumbnail_width,
-            "pre_rotate": "None",  # Default, can be updated later
         }
+        
+        logger.info(f"Registration completed successfully: rotation={rotation_degrees:.2f}°, scale={scaling:.4f}")
+        
+        return result
         
     except Exception as e:
         logger.error(f"Registration failed: {e}", exc_info=True)
         return {
+            "success": False,
+            "error": str(e),
             "transform_matrix": np.eye(3).tolist(),
             "rotation_degrees": 0.0,
             "offset_x": 0.0,
             "offset_y": 0.0,
             "scale": 1.0,
             "mutual_information": 0.0,
-            "normalized_cross_correlation": None,
-            "structural_similarity": None,
-            "success": False,
-            "error": str(e),
+            "reg_image_size": thumbnail_width,
+            "thumbnail_width": thumbnail_width,
         }
 
 
-def _get_image_hash(img: np.ndarray) -> str:
-    """Generate a hash for an image array to use as cache key"""
-    import hashlib
-    return hashlib.md5(img.tobytes()).hexdigest()[:16]
-
-
-def register_rigid(
-    fixed_id: str,
-    moving_id: str,
-    thumbnail_width: int = 1024
-) -> Dict[str, Any]:
+def calculate_mutual_information(img1: np.ndarray, img2: np.ndarray, bins: int = 32) -> float:
     """
-    Perform rigid registration using SimpleITK (with caching)
+    Calculate mutual information between two images
     
     Args:
-        fixed_id: DSA item ID of fixed (reference) image
-        moving_id: DSA item ID of moving image
-        thumbnail_width: Width of thumbnail to use for registration
+        img1: First image (grayscale)
+        img2: Second image (grayscale)
+        bins: Number of bins for histogram
         
     Returns:
-        Dictionary with registration results:
-        - transform_matrix: 3x3 affine transformation matrix
-        - rotation_degrees: Rotation in degrees
-        - offset_x: X translation
-        - offset_y: Y translation
-        - scale: Scale factor
-        - mutual_information: MI score
-        - success: Whether registration succeeded
+        Mutual information value
+    """
+    # Ensure images are same size
+    if img1.shape != img2.shape:
+        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+    
+    # Flatten the images
+    img1_flat = img1.flatten()
+    img2_flat = img2.flatten()
+    
+    # Calculate joint histogram
+    hist_2d, _, _ = np.histogram2d(img1_flat, img2_flat, bins=bins)
+    
+    # Convert to probability distribution
+    pxy = hist_2d / float(np.sum(hist_2d))
+    px = np.sum(pxy, axis=1)  # marginal for x
+    py = np.sum(pxy, axis=0)  # marginal for y
+    px_py = px[:, None] * py[None, :]
+    
+    # Avoid log(0)
+    nonzero = pxy > 0
+    
+    # Calculate mutual information
+    mi = np.sum(pxy[nonzero] * np.log(pxy[nonzero] / px_py[nonzero]))
+    return float(mi)
+
+
+def calculate_normalized_cross_correlation(img1: np.ndarray, img2: np.ndarray) -> float:
+    """
+    Calculate normalized cross-correlation between two images
+    
+    Args:
+        img1: First image (grayscale)
+        img2: Second image (grayscale)
+        
+    Returns:
+        Normalized cross-correlation coefficient (-1 to 1)
+    """
+    # Ensure images are same size
+    if img1.shape != img2.shape:
+        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+    
+    # Convert to float and normalize
+    img1_norm = img1.astype(np.float64) - np.mean(img1)
+    img2_norm = img2.astype(np.float64) - np.mean(img2)
+    
+    # Calculate cross-correlation
+    numerator = np.sum(img1_norm * img2_norm)
+    denominator = np.sqrt(np.sum(img1_norm**2) * np.sum(img2_norm**2))
+    
+    if denominator == 0:
+        return 0.0
+    
+    ncc = numerator / denominator
+    return float(ncc)
+
+
+def calculate_structural_similarity(img1: np.ndarray, img2: np.ndarray) -> float:
+    """
+    Calculate structural similarity index (SSIM) between two images
+    
+    Args:
+        img1: First image (grayscale)
+        img2: Second image (grayscale)
+        
+    Returns:
+        SSIM value (0 to 1, higher is better)
     """
     try:
-        # Get thumbnail images first (to compute hashes)
-        logger.debug(f"Fetching thumbnails for registration: fixed={fixed_id}, moving={moving_id}")
-        fixed_img = get_thumbnail_image(fixed_id, width=thumbnail_width)
-        moving_img = get_thumbnail_image(moving_id, width=thumbnail_width)
-        
-        if fixed_img is None or moving_img is None:
-            raise ValueError("Failed to retrieve thumbnail images")
-        
-        # Compute image hashes for cache invalidation
-        fixed_hash = _get_image_hash(fixed_img)
-        moving_hash = _get_image_hash(moving_img)
-        
-        # Call cached registration function
-        return _register_rigid_cached(
-            fixed_id,
-            moving_id,
-            fixed_hash,
-            moving_hash,
-            thumbnail_width
-        )
-    except Exception as e:
-        logger.error(f"Registration failed: {e}", exc_info=True)
-        return {
-            "transform_matrix": np.eye(3).tolist(),
-            "rotation_degrees": 0.0,
-            "offset_x": 0.0,
-            "offset_y": 0.0,
-            "scale": 1.0,
-            "mutual_information": 0.0,
-            "normalized_cross_correlation": None,
-            "structural_similarity": None,
-            "success": False,
-            "error": str(e),
-        }
-
+        from skimage.metrics import structural_similarity as ssim
+    except ImportError:
+        # Fallback implementation if skimage is not available
+        logger.warning("skimage.metrics.structural_similarity not available, using simple implementation")
+        return calculate_normalized_cross_correlation(img1, img2)
+    
+    # Ensure images are same size
+    if img1.shape != img2.shape:
+        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+    
+    # Calculate SSIM
+    # data_range is the range of the image data (e.g., 255 for uint8, 1.0 for float)
+    if img1.dtype == np.uint8:
+        data_range = 255
+    else:
+        data_range = img1.max() - img1.min()
+        if data_range == 0:
+            data_range = 1.0
+    
+    ssim_value = ssim(img1, img2, data_range=data_range)
+    return float(ssim_value)
